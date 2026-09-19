@@ -1,1 +1,5 @@
-Flow Radar V2 diagnostic. Separates Binance/Bybit, detects exceptional flow, records 5/30/60/300s outcomes. No keys; no orders.
+Flow Radar V2.1 diagnostic.
+Binance USDⓈ-M Futures WebSocket path corrected to the current /market path.
+Binance connection/data confirmation added.
+Bybit, event thresholds, outcome tracking and all other V2 logic are unchanged.
+Read-only; no API keys; no orders.

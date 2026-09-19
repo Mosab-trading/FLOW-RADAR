@@ -10,11 +10,16 @@ def add(ex,s,p,q,side,ts):
  t={"ts":ts,"ex":ex,"s":s,"p":p,"q":q,"usd":p*q,"side":side};buf[s].append(t)
  with raw.open("a") as f:f.write(json.dumps(t)+"\n")
 async def bn(s):
- u=f"wss://fstream.binance.com/public/ws/{s.lower()}@aggTrade"
+ u=f"wss://fstream.binance.com/market/ws/{s.lower()}@aggTrade"
  while 1:
   try:
    async with websockets.connect(u,ping_interval=120,ping_timeout=20) as w:
+    print("BINANCE CONNECTED",s,u)
+    first=True
     async for r in w:
+     if first:
+      print("BINANCE DATA OK",s)
+      first=False
      x=json.loads(r);p=float(x["p"]);q=float(x["q"]);add("BINANCE",s,p,q,"SELL" if x.get("m") else "BUY",x.get("T",x["E"])/1000)
   except Exception as e: print("BINANCE reconnect",s,e);await asyncio.sleep(3)
 async def bb(s):
