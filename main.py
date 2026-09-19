@@ -17,29 +17,24 @@ def http_json(url):
  with urllib.request.urlopen(url,timeout=15) as r:return json.loads(r.read())
 
 async def load_meta():
- # OKX SWAP metadata via the official public WebSocket instruments channel.
- # This avoids environments where the public REST endpoint returns HTTP 403.
- try:
-  u="wss://ws.okx.com:8443/ws/v5/public"
-  wanted={x.replace("USDT","-USDT-SWAP") for x in SYMBOLS}
-  async with websockets.connect(u,ping_interval=20,ping_timeout=20) as w:
-   await w.send(json.dumps({"op":"subscribe","args":[{"channel":"instruments","instType":"SWAP"}]}))
-   deadline=time.time()+15
-   while time.time()<deadline and len([k for k in multipliers if k[0]=="OKX"])<len(wanted):
-    msg=json.loads(await asyncio.wait_for(w.recv(),timeout=5))
-    for z in msg.get("data",[]):
-     iid=z.get("instId","")
-     if iid in wanted and z.get("ctVal"):
-      multipliers[("OKX",iid)]=float(z["ctVal"])
-  print("OKX CONTRACT META OK",len([k for k in multipliers if k[0]=="OKX"]),"/",len(wanted))
- except Exception as e: print("OKX META WS ERROR",repr(e))
- # Gate USDT futures quanto_multiplier
+ # OKX USDT-SWAP contract multipliers for the four symbols tracked by this build.
+ # Avoids Railway REST/WS metadata failures; SWAP trade sz is contract count.
+ okx_ctval={
+  "BTC-USDT-SWAP":0.01,
+  "ETH-USDT-SWAP":0.1,
+  "SOL-USDT-SWAP":1.0,
+  "XRP-USDT-SWAP":100.0,
+ }
+ for inst,val in okx_ctval.items():
+  multipliers[("OKX",inst)]=val
+ print("OKX CONTRACT META LOCAL OK",len(okx_ctval))
+ # Gate metadata remains unchanged.
  for s in SYMBOLS:
-  c=s.replace("USDT","_USDT")
   try:
-   z=await asyncio.to_thread(http_json,f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{c}")
-   multipliers[("GATE",c)]=float(z["quanto_multiplier"])
-  except Exception as e: print("GATE META ERROR",c,e)
+   c=s.replace("USDT","_USDT")
+   x=await asyncio.to_thread(http_json,f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{c}")
+   multipliers[("GATE",c)]=float(x["quanto_multiplier"])
+  except Exception as e: print("GATE META ERROR",s,e)
  print("GATE CONTRACT META OK",len([k for k in multipliers if k[0]=="GATE"]))
 
 async def binance(s,spot):
@@ -71,7 +66,7 @@ async def bybit(s,spot):
 async def okx(s,spot):
  ex="OKX_SPOT" if spot else "OKX_FUTURES"; inst=s.replace("USDT","-USDT")+("" if spot else "-SWAP")
  u="wss://ws.okx.com:8443/ws/v5/public"
- channel="trades" if spot else "trades-all"
+ channel="trades"
  while 1:
   try:
    async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
@@ -165,7 +160,7 @@ def outcomes():
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.2 | 4 EXCHANGES | SPOT + FUTURES | {W}s ===")
+  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.3 | 4 EXCHANGES | SPOT + FUTURES | {W}s ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -181,7 +176,7 @@ async def report():
   outcomes()
 
 async def main():
- print("FLOW RADAR V3.2 STARTED | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY")
+ print("FLOW RADAR V3.3 STARTED | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY")
  await load_meta()
  tasks=[report()]
  for s in SYMBOLS:
