@@ -1,5 +1,6 @@
-Flow Radar V2.1 diagnostic.
-Binance USDⓈ-M Futures WebSocket path corrected to the current /market path.
-Binance connection/data confirmation added.
-Bybit, event thresholds, outcome tracking and all other V2 logic are unchanged.
+Flow Radar V3
+Four exchanges, each with Spot + USDT perpetual/futures:
+Binance, Bybit, OKX, Gate.
+Shows each feed separately plus SPOT TOTAL, FUTURES TOTAL, GLOBAL FLOW and exchange/market agreement.
+OKX and Gate futures contract sizes are normalized using public instrument metadata before conversion to USD notional.
 Read-only; no API keys; no orders.
