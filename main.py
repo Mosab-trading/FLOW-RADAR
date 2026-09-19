@@ -71,21 +71,35 @@ async def bybit(s,spot):
 async def okx(s,spot):
  ex="OKX_SPOT" if spot else "OKX_FUTURES"; inst=s.replace("USDT","-USDT")+("" if spot else "-SWAP")
  u="wss://ws.okx.com:8443/ws/v5/public"
+ channel="trades" if spot else "trades-all"
  while 1:
   try:
    async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
-    await w.send(json.dumps({"op":"subscribe","args":[{"channel":"trades","instId":inst}]}));print(ex,"CONNECTED",s);first=True
+    arg={"channel":channel,"instId":inst}
+    await w.send(json.dumps({"op":"subscribe","args":[arg]}))
+    print(ex,"CONNECTED",s,"channel="+channel,"instId="+inst)
+    first=True; diag=0
     async for r in w:
      x=json.loads(r)
-     for z in x.get("data",[]):
-      if first:print(ex,"DATA OK",s);first=False
+     if x.get("event") in ("subscribe","error"):
+      print(ex,"OKX RESPONSE",s,json.dumps(x,separators=(",",":"))[:1000])
+      continue
+     rows=x.get("data",[])
+     if not rows: continue
+     if diag<2:
+      print(ex,"RAW DATA",s,json.dumps(rows[0],separators=(",",":"))[:1000]);diag+=1
+     for z in rows:
       p=float(z["px"]); q=float(z["sz"])
       if not spot:
        m=multipliers.get(("OKX",inst))
-       if not m: continue
+       if not m:
+        print(ex,"SKIP NO ctVal",s,inst,"raw_sz="+str(z.get("sz")))
+        continue
        q*=m
+      if first:print(ex,"DATA OK",s,"ctVal="+str(multipliers.get(("OKX",inst),"SPOT")));first=False
       add(ex,s,p,q,z["side"].upper(),int(z["ts"])/1000)
-  except Exception as e:print(ex,"reconnect",s,repr(e));await asyncio.sleep(3)
+  except Exception as e:
+   print(ex,"reconnect",s,repr(e));await asyncio.sleep(3)
 
 async def gate(s,spot):
  ex="GATE_SPOT" if spot else "GATE_FUTURES"; c=s.replace("USDT","_USDT")
@@ -151,7 +165,7 @@ def outcomes():
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3 | 4 EXCHANGES | SPOT + FUTURES | {W}s ===")
+  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.2 | 4 EXCHANGES | SPOT + FUTURES | {W}s ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -167,7 +181,7 @@ async def report():
   outcomes()
 
 async def main():
- print("FLOW RADAR V3.1 STARTED | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY")
+ print("FLOW RADAR V3.2 STARTED | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY")
  await load_meta()
  tasks=[report()]
  for s in SYMBOLS:
