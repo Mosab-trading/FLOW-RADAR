@@ -17,14 +17,22 @@ def http_json(url):
  with urllib.request.urlopen(url,timeout=15) as r:return json.loads(r.read())
 
 async def load_meta():
- # OKX SWAP ctVal/ctValCcy. For USDT linear swaps ctVal is base-asset value per contract.
+ # OKX SWAP metadata via the official public WebSocket instruments channel.
+ # This avoids environments where the public REST endpoint returns HTTP 403.
  try:
-  x=await asyncio.to_thread(http_json,"https://www.okx.com/api/v5/public/instruments?instType=SWAP")
-  for z in x.get("data",[]):
-   if z.get("instId","").endswith("-USDT-SWAP") and z.get("ctVal"):
-    multipliers[("OKX",z["instId"])]=float(z["ctVal"])
-  print("OKX CONTRACT META OK",len([k for k in multipliers if k[0]=="OKX"]))
- except Exception as e: print("OKX META ERROR",e)
+  u="wss://ws.okx.com:8443/ws/v5/public"
+  wanted={x.replace("USDT","-USDT-SWAP") for x in SYMBOLS}
+  async with websockets.connect(u,ping_interval=20,ping_timeout=20) as w:
+   await w.send(json.dumps({"op":"subscribe","args":[{"channel":"instruments","instType":"SWAP"}]}))
+   deadline=time.time()+15
+   while time.time()<deadline and len([k for k in multipliers if k[0]=="OKX"])<len(wanted):
+    msg=json.loads(await asyncio.wait_for(w.recv(),timeout=5))
+    for z in msg.get("data",[]):
+     iid=z.get("instId","")
+     if iid in wanted and z.get("ctVal"):
+      multipliers[("OKX",iid)]=float(z["ctVal"])
+  print("OKX CONTRACT META OK",len([k for k in multipliers if k[0]=="OKX"]),"/",len(wanted))
+ except Exception as e: print("OKX META WS ERROR",repr(e))
  # Gate USDT futures quanto_multiplier
  for s in SYMBOLS:
   c=s.replace("USDT","_USDT")
@@ -159,7 +167,7 @@ async def report():
   outcomes()
 
 async def main():
- print("FLOW RADAR V3 STARTED | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY")
+ print("FLOW RADAR V3.1 STARTED | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY")
  await load_meta()
  tasks=[report()]
  for s in SYMBOLS:
