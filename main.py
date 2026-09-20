@@ -7,6 +7,9 @@ SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
 D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"
 buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
+# V3.5 diagnostic confirmation layer; original EVENT/RESULT logic remains unchanged.
+flow_history=defaultdict(lambda:deque(maxlen=120))
+setup_last={}
 
 def add(ex,s,p,base_qty,side,ts):
  usd=p*base_qty
@@ -157,10 +160,90 @@ def outcomes():
     w.writerow([e["ts"],e["s"],e["dir"],e["entry"],e["b"],e["sell"],e["d"],e["im"],r["5"],r["30"],r["60"],r["300"]])
    print(f'RESULT {e["s"]} {e["dir"]} 5s={r["5"]:+.3f}% 30s={r["30"]:+.3f}% 60s={r["60"]:+.3f}% 300s={r["300"]:+.3f}%');pending.remove(e)
 
+def remember_confirm(s,p,sd,fd,ad,ai,gbuy,gsell,vbuy,vsell):
+ h=flow_history[s]; n=time.time()
+ h.append({"ts":n,"p":p,"sd":sd,"fd":fd,"d":ad,"im":ai,
+           "gbuy":gbuy,"gsell":gsell,"vbuy":vbuy,"vsell":vsell})
+ while h and n-h[0]["ts"]>70:h.popleft()
+
+def confirm(s,secs):
+ n=time.time(); r=[x for x in flow_history[s] if n-x["ts"]<=secs]
+ if len(r)<3:return f"FLOW CONFIRM {secs}s WARMING | samples={len(r)}"
+
+ pos=sum(x["d"]>0 for x in r); neg=sum(x["d"]<0 for x in r)
+ side="BUY" if pos>neg else "SELL" if neg>pos else "NEUTRAL"
+ persist=max(pos,neg)/len(r)
+
+ cum=sum(x["d"] for x in r)
+ total_buy=sum(x["gbuy"] for x in r); total_sell=sum(x["gsell"] for x in r)
+ total=total_buy+total_sell
+ wimb=cum/total*100 if total else 0
+
+ vbuy=sum(x["vbuy"] for x in r); vsell=sum(x["vsell"] for x in r)
+ vtot=vbuy+vsell
+ agreement=max(vbuy,vsell)/vtot if vtot else 0
+ vote="BUY" if vbuy>vsell else "SELL" if vsell>vbuy else "NEUTRAL"
+
+ spot=sum(x["sd"] for x in r); fut=sum(x["fd"] for x in r)
+ aligned=(side=="BUY" and spot>0 and fut>0) or (side=="SELL" and spot<0 and fut<0)
+
+ move=(r[-1]["p"]/r[0]["p"]-1)*100 if r[0]["p"] else 0
+ priceok=(side=="BUY" and move>0) or (side=="SELL" and move<0)
+
+ strong=side!="NEUTRAL" and persist>=.67 and abs(wimb)>=45 and agreement>=.67 and vote==side and aligned and priceok
+ normal=side!="NEUTRAL" and persist>=.60 and abs(wimb)>=30 and agreement>=.60 and vote==side and priceok
+
+ if strong: label="STRONG "+side
+ elif normal: label=side
+ elif side!="NEUTRAL" and persist>=.67 and abs(wimb)>=45 and vote==side and not priceok:
+  label=side+" ABSORPTION"
+ else: label="NEUTRAL"
+
+ return (f"FLOW CONFIRM {secs}s {label} | persistence={persist*100:.0f}% "
+         f"| cumDelta=${cum:,.0f} | weightedIMB={wimb:+.1f}% "
+         f"| agreement={agreement*100:.0f}% | spotFut={'YES' if aligned else 'NO'} "
+         f"| priceMove={move:+.3f}% | priceConfirm={'YES' if priceok else 'NO'}")
+
+def fast_setup(s):
+ """Report-only entry candidate. Does not place trades or change raw EVENT logic."""
+ n=time.time(); r=[x for x in flow_history[s] if n-x["ts"]<=15]
+ if len(r)<3:return None
+
+ pos=sum(x["d"]>0 for x in r); neg=sum(x["d"]<0 for x in r)
+ side="BUY" if pos>neg else "SELL" if neg>pos else "NEUTRAL"
+ if side=="NEUTRAL":return None
+
+ persist=max(pos,neg)/len(r)
+ cum=sum(x["d"] for x in r)
+ tb=sum(x["gbuy"] for x in r); ts=sum(x["gsell"] for x in r); total=tb+ts
+ wimb=cum/total*100 if total else 0
+
+ vb=sum(x["vbuy"] for x in r); vs=sum(x["vsell"] for x in r); vt=vb+vs
+ agreement=max(vb,vs)/vt if vt else 0
+ vote="BUY" if vb>vs else "SELL" if vs>vb else "NEUTRAL"
+
+ spot=sum(x["sd"] for x in r); fut=sum(x["fd"] for x in r)
+ aligned=(side=="BUY" and spot>0 and fut>0) or (side=="SELL" and spot<0 and fut<0)
+
+ # Fast signal: persistence + strong normalized flow + broad feed agreement + spot/futures alignment.
+ ok=(persist>=.67 and abs(wimb)>=45 and agreement>=.75 and vote==side and aligned)
+ if not ok:return None
+
+ # Avoid printing the same setup every 5 seconds.
+ key=(s,side)
+ if n-setup_last.get(key,0)<15:return None
+ setup_last[key]=n
+
+ p=price(s)
+ return (f"TRADE SETUP {s} {side} price={p} | window=15s "
+         f"| persistence={persist*100:.0f}% | cumDelta=${cum:,.0f} "
+         f"| weightedIMB={wimb:+.1f}% | agreement={agreement*100:.0f}% "
+         f"| spotFut=YES | REPORT-ONLY")
+
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.3 | 4 EXCHANGES | SPOT + FUTURES | {W}s ===")
+  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.5 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -172,11 +255,17 @@ async def report():
    print(f" FUTURES TOTAL     D=${fd:,.0f} IMB={fi:+.1f}% B=${fb:,.0f} S=${fs:,.0f}")
    print(f" GLOBAL FLOW       D=${ad:,.0f} IMB={ai:+.1f}% B=${ab:,.0f} S=${ase:,.0f}")
    print(f" AGREEMENT         BUY={votes.count('BUY')}/{len(votes)} SELL={votes.count('SELL')}/{len(votes)} active feeds")
+   remember_confirm(s,price(s),sd,fd,ad,ai,ab,ase,votes.count("BUY"),votes.count("SELL"))
+   print(" "+confirm(s,15))
+   print(" "+confirm(s,30))
+   print(" "+confirm(s,60))
+   setup=fast_setup(s)
+   if setup: print(" "+setup)
    detect(s)
   outcomes()
 
 async def main():
- print("FLOW RADAR V3.3 STARTED | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY")
+ print("FLOW RADAR V3.5 STARTED | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
  await load_meta()
  tasks=[report()]
  for s in SYMBOLS:
