@@ -19,42 +19,68 @@ def add(ex,s,p,base_qty,side,ts):
  with RAW.open("a") as f:f.write(json.dumps(t,separators=(",",":"))+"\n")
 
 def http_json(url):
- with urllib.request.urlopen(url,timeout=15) as r:return json.loads(r.read())
+ req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 FlowRadar/3.9","Accept":"application/json"})
+ with urllib.request.urlopen(req,timeout=15) as r:return json.loads(r.read())
 
 async def load_meta():
- # V3.8: query OKX metadata per instrument. This is more robust than relying on one bulk response.
- # OKX SWAP trade sz is contract count; base quantity = sz * ctVal * ctMult when ctValCcy is base coin.
- okx_ok=0; okx_skip=[]
- for s in SYMBOLS:
-  inst=s.replace("USDT","-USDT-SWAP")
+ # V3.9: OKX REST may return HTTP 403 from cloud IPs. Try REST first, then the public
+ # WebSocket instruments snapshot (same OKX public WS already used successfully for trades).
+ targets={s.replace("USDT","-USDT-SWAP"):s for s in SYMBOLS}
+ okx_rows={}
+ try:
+  x=await asyncio.to_thread(http_json,"https://www.okx.com/api/v5/public/instruments?instType=SWAP")
+  for z in x.get("data",[]):
+   if z.get("instId") in targets: okx_rows[z["instId"]]=z
+  print("OKX META REST",len(okx_rows),"/",len(targets))
+ except Exception as e:
+  print("OKX META REST FAILED",repr(e),"-> WS fallback")
+
+ if len(okx_rows)<len(targets):
   try:
-   url=f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst}"
-   x=await asyncio.to_thread(http_json,url)
-   rows=x.get("data",[])
-   z=next((r for r in rows if r.get("instId")==inst),None)
-   if not z: raise ValueError("instrument not returned")
+   u="wss://ws.okx.com:8443/ws/v5/public"
+   async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
+    await w.send(json.dumps({"op":"subscribe","args":[{"channel":"instruments","instType":"SWAP"}]}))
+    deadline=time.time()+12
+    while time.time()<deadline and len(okx_rows)<len(targets):
+     try: r=await asyncio.wait_for(w.recv(),timeout=max(0.2,deadline-time.time()))
+     except asyncio.TimeoutError: break
+     x=json.loads(r)
+     if x.get("event")=="error":
+      print("OKX META WS ERROR",json.dumps(x,separators=(",",":"))[:500]);break
+     for z in x.get("data",[]):
+      if z.get("instId") in targets: okx_rows[z["instId"]]=z
+   print("OKX META WS",len(okx_rows),"/",len(targets))
+  except Exception as e: print("OKX META WS FAILED",repr(e))
+
+ okx_ok=0; okx_skip=[]
+ for inst,sym in targets.items():
+  try:
+   z=okx_rows.get(inst)
+   if not z: raise ValueError("instrument metadata not returned")
    cv=float(z.get("ctVal") or 0); cm=float(z.get("ctMult") or 1)
-   ccy=(z.get("ctValCcy") or "").upper()
-   base=s[:-4]
+   ccy=(z.get("ctValCcy") or "").upper(); base=sym[:-4]
    if cv<=0: raise ValueError("missing ctVal")
-   # Our add() expects base-coin quantity. For USDT linear swaps ctValCcy should be the base coin.
    if ccy and ccy not in (base,"USD"):
     raise ValueError(f"unexpected ctValCcy={ccy}")
-   multipliers[("OKX",inst)]=cv*cm
-   okx_ok+=1
+   multipliers[("OKX",inst)]=cv*cm; okx_ok+=1
+   print("OKX META OK",sym,inst,"ctVal=",cv,"ctMult=",cm,"mult=",cv*cm,"ccy=",ccy)
   except Exception as e:
-   okx_skip.append(s)
-   print("OKX META SKIP",s,repr(e))
- print("OKX CONTRACT META V3.8",okx_ok,"/",len(SYMBOLS),"loaded","skipped="+",".join(okx_skip) if okx_skip else "all-ok")
+   okx_skip.append(sym); print("OKX META SKIP",sym,repr(e))
+ print("OKX CONTRACT META V3.9",okx_ok,"/",len(SYMBOLS),"loaded","skipped="+",".join(okx_skip) if okx_skip else "all-ok")
 
- # Gate metadata remains unchanged.
+ # Safety fallback for the four original contracts only, preserving the original known values.
+ fallback={"BTC-USDT-SWAP":0.01,"ETH-USDT-SWAP":0.1,"SOL-USDT-SWAP":1.0,"XRP-USDT-SWAP":100.0}
+ for inst,m in fallback.items():
+  if ("OKX",inst) not in multipliers:
+   multipliers[("OKX",inst)]=m; print("OKX META FALLBACK",inst,"mult=",m)
+
+ # Gate metadata unchanged.
  for s in SYMBOLS:
   try:
    c=s.replace("USDT","_USDT")
    x=await asyncio.to_thread(http_json,f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{c}")
    multipliers[("GATE",c)]=float(x["quanto_multiplier"])
-  except Exception as e: print("GATE META ERROR",s,e)
- print("GATE CONTRACT META OK",len([k for k in multipliers if k[0]=="GATE"]))
+  except Exception as e: print("GATE META SKIP",s,repr(e))
 
 async def binance(s,spot):
  ex="BINANCE_SPOT" if spot else "BINANCE_FUTURES"
@@ -288,7 +314,7 @@ def fast_setup(s):
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.8 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
+  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.9 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -312,7 +338,7 @@ async def report():
   outcomes()
 
 async def main():
- print("FLOW RADAR V3.8 STARTED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
+ print("FLOW RADAR V3.9 STARTED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
  await load_meta()
  tasks=[report()]
  for s in SYMBOLS:
