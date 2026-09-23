@@ -7,11 +7,12 @@ SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT
 ALT_CORE=[x.strip().upper() for x in os.getenv("ALT_CORE","APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",") if x.strip()]
 ALT_MIN_AVG_USD=float(os.getenv("ALT_MIN_AVG_USD","1000")); ALT_MIN_AVG_FEEDS=float(os.getenv("ALT_MIN_AVG_FEEDS","2"))
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
-D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"
+D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"; SCORES=D/"flow_scores.csv"
 buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
 # V3.5 diagnostic confirmation layer; original EVENT/RESULT logic remains unchanged.
 flow_history=defaultdict(lambda:deque(maxlen=120))
 setup_last={}
+score_pending=[]; score_last={}
 
 def add(ex,s,p,base_qty,side,ts):
  usd=p*base_qty
@@ -275,6 +276,106 @@ def alt_breadth(secs):
          f"| altMedian={median:+.3f}% BTC={btc_ret:+.3f}% RS={rs:+.3f}% "
          f"| outperformBTC={out}/{len(rows)} positive={pos}/{len(rows)} oppositeBTC={opp}/{len(rows)}")
 
+
+
+def window_metrics(s,secs):
+ n=time.time(); r=[x for x in flow_history[s] if n-x["ts"]<=secs]
+ if len(r)<3 or not r[0]["p"]: return None
+ pos=sum(x["d"]>0 for x in r); neg=sum(x["d"]<0 for x in r)
+ side="BUY" if pos>neg else "SELL" if neg>pos else "NEUTRAL"
+ persist=max(pos,neg)/len(r)
+ cum=sum(x["d"] for x in r); tb=sum(x["gbuy"] for x in r); ts=sum(x["gsell"] for x in r); tot=tb+ts
+ wimb=cum/tot*100 if tot else 0
+ vb=sum(x["vbuy"] for x in r); vs=sum(x["vsell"] for x in r); vt=vb+vs
+ agreement=max(vb,vs)/vt if vt else 0
+ vote="BUY" if vb>vs else "SELL" if vs>vb else "NEUTRAL"
+ spot=sum(x["sd"] for x in r); fut=sum(x["fd"] for x in r)
+ aligned=(side=="BUY" and spot>0 and fut>0) or (side=="SELL" and spot<0 and fut<0)
+ move=(r[-1]["p"]/r[0]["p"]-1)*100
+ priceok=(side=="BUY" and move>0) or (side=="SELL" and move<0)
+ sign=1 if side=="BUY" else -1 if side=="SELL" else 0
+ return {"side":side,"sign":sign,"persist":persist,"cum":cum,"wimb":wimb,"agreement":agreement,
+         "vote":vote,"aligned":aligned,"move":move,"priceok":priceok,"spot":spot,"fut":fut}
+
+def breadth_metrics(secs=60):
+ n=time.time(); rows=[]
+ for s in ALT_CORE:
+  r=[x for x in flow_history[s] if n-x["ts"]<=secs]
+  if len(r)<3 or not r[0]["p"]: continue
+  cum=sum(x["d"] for x in r); tb=sum(x["gbuy"] for x in r); ts=sum(x["gsell"] for x in r); tot=tb+ts
+  avg_usd=tot/len(r); avg_feeds=sum(x["vbuy"]+x["vsell"] for x in r)/len(r)
+  if avg_usd<ALT_MIN_AVG_USD or avg_feeds<ALT_MIN_AVG_FEEDS: continue
+  wimb=cum/tot*100 if tot else 0; ret=(r[-1]["p"]/r[0]["p"]-1)*100
+  rows.append((s,1 if wimb>=15 else -1 if wimb<=-15 else 0,ret))
+ br=[x for x in flow_history["BTCUSDT"] if n-x["ts"]<=secs]
+ btc=(br[-1]["p"]/br[0]["p"]-1)*100 if len(br)>=3 and br[0]["p"] else 0
+ if not rows:return {"valid":0,"net":0,"rs":0,"positive":0}
+ rets=sorted(x[2] for x in rows); med=rets[len(rets)//2] if len(rets)%2 else (rets[len(rets)//2-1]+rets[len(rets)//2])/2
+ return {"valid":len(rows),"net":sum(x[1] for x in rows)/len(rows),"rs":med-btc,"positive":sum(x[2]>0 for x in rows)/len(rows)}
+
+def flow_score(s):
+ """V4.0 report-only score. Range -100..+100; no order placement."""
+ m15,m30,m60=window_metrics(s,15),window_metrics(s,30),window_metrics(s,60)
+ if not all((m15,m30,m60)): return None
+ # 35 pts: multi-window flow momentum. 60s gets the largest weight.
+ flowpart=0
+ for m,w in ((m15,7),(m30,12),(m60,16)):
+  strength=min(1.0,abs(m["wimb"])/45.0)*min(1.0,m["persist"]/.67)
+  flowpart += m["sign"]*w*strength
+ # 20 pts: spot/futures + venue agreement, concentrated on 30/60s.
+ conf=0
+ for m,w in ((m30,8),(m60,12)):
+  if m["sign"]:
+   q=min(1.0,m["agreement"]/.67)*(1.0 if m["aligned"] else .35)
+   conf += m["sign"]*w*q
+ # 15 pts: price confirmation; opposite price action is treated as absorption/divergence.
+ pricepart=0
+ for m,w in ((m30,6),(m60,9)):
+  if m["sign"]: pricepart += m["sign"]*w*(1 if m["priceok"] else -.45)
+ # 15 pts: BTC regime modifier for alts only. BTC itself gets its own flow as the market context.
+ btcpart=0
+ if s!="BTCUSDT":
+  b30,b60=window_metrics("BTCUSDT",30),window_metrics("BTCUSDT",60)
+  if b30 and b60:
+   btcpart=7*b30["sign"]*min(1,abs(b30["wimb"])/45)+8*b60["sign"]*min(1,abs(b60["wimb"])/45)
+ # 15 pts: alt breadth/relative strength modifier for alts.
+ breadthpart=0; bm=breadth_metrics(60)
+ if s!="BTCUSDT" and bm["valid"]>=3:
+  breadthpart=9*max(-1,min(1,bm["net"])) + 6*max(-1,min(1,bm["rs"]/.20))
+ raw=flowpart+conf+pricepart+btcpart+breadthpart
+ score=max(-100,min(100,round(raw)))
+ if score>=65: regime="STRONG LONG"
+ elif score>=35: regime="LONG BIAS"
+ elif score<=-65: regime="STRONG SHORT"
+ elif score<=-35: regime="SHORT BIAS"
+ else: regime="NEUTRAL"
+ return {"score":score,"regime":regime,"flow":round(flowpart,1),"confirm":round(conf,1),"price":round(pricepart,1),
+         "btc":round(btcpart,1),"breadth":round(breadthpart,1),"bvalid":bm["valid"],"rs":bm["rs"],
+         "m30":m30["side"],"m60":m60["side"]}
+
+def record_score(s,fs):
+ n=time.time()
+ if n-score_last.get(s,0)<15:return
+ p=price(s)
+ if not p:return
+ score_last[s]=n
+ score_pending.append({"ts":n,"s":s,"p":p,"score":fs["score"],"regime":fs["regime"],"flow":fs["flow"],
+                       "confirm":fs["confirm"],"pricepart":fs["price"],"btc":fs["btc"],"breadth":fs["breadth"],"rs":fs["rs"],"r":{}})
+
+def score_outcomes():
+ n=time.time()
+ for e in score_pending[:]:
+  for h in (30,60,180,300,900):
+   if str(h) not in e["r"] and n>=e["ts"]+h and price(e["s"]): e["r"][str(h)]=(price(e["s"])/e["p"]-1)*100
+  if "900" in e["r"]:
+   new=not SCORES.exists(); r=e["r"]
+   with SCORES.open("a",newline="") as f:
+    w=csv.writer(f)
+    if new:w.writerow(["time","symbol","entry_price","score","regime","flow_component","confirm_component","price_component","btc_component","breadth_component","rs60","ret30","ret60","ret180","ret300","ret900"])
+    w.writerow([e["ts"],e["s"],e["p"],e["score"],e["regime"],e["flow"],e["confirm"],e["pricepart"],e["btc"],e["breadth"],e["rs"],r["30"],r["60"],r["180"],r["300"],r["900"]])
+   print(f'SCORE RESULT {e["s"]} score={e["score"]:+d} 30s={r["30"]:+.3f}% 60s={r["60"]:+.3f}% 3m={r["180"]:+.3f}% 5m={r["300"]:+.3f}% 15m={r["900"]:+.3f}%')
+   score_pending.remove(e)
+
 def fast_setup(s):
  """Report-only entry candidate. Does not place trades or change raw EVENT logic."""
  n=time.time(); r=[x for x in flow_history[s] if n-x["ts"]<=15]
@@ -314,7 +415,7 @@ def fast_setup(s):
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.9 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
+  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V4.0 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -330,15 +431,19 @@ async def report():
    print(" "+confirm(s,15))
    print(" "+confirm(s,30))
    print(" "+confirm(s,60))
+   fs=flow_score(s)
+   if fs:
+    print(f" FLOW SCORE        {fs['score']:+d}/100 | {fs['regime']} | flow={fs['flow']:+.1f} confirm={fs['confirm']:+.1f} price={fs['price']:+.1f} btc={fs['btc']:+.1f} breadth={fs['breadth']:+.1f} | RS60={fs['rs']:+.3f}% valid={fs['bvalid']} | 30s={fs['m30']} 60s={fs['m60']} | REPORT-ONLY")
+    record_score(s,fs)
    setup=fast_setup(s)
    if setup: print(" "+setup)
    detect(s)
   print("\n "+alt_breadth(30))
   print(" "+alt_breadth(60))
-  outcomes()
+  outcomes(); score_outcomes()
 
 async def main():
- print("FLOW RADAR V3.9 STARTED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
+ print("FLOW RADAR V4.0 STARTED | FLOW SCORE + CALIBRATION | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
  await load_meta()
  tasks=[report()]
  for s in SYMBOLS:
