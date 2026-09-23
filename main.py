@@ -5,7 +5,7 @@ import websockets
 
 SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",")]
 ALT_CORE=[x.strip().upper() for x in os.getenv("ALT_CORE","APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",") if x.strip()]
-ALT_MIN_AVG_USD=float(os.getenv("ALT_MIN_AVG_USD","5000")); ALT_MIN_AVG_FEEDS=float(os.getenv("ALT_MIN_AVG_FEEDS","2"))
+ALT_MIN_AVG_USD=float(os.getenv("ALT_MIN_AVG_USD","1000")); ALT_MIN_AVG_FEEDS=float(os.getenv("ALT_MIN_AVG_FEEDS","2"))
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
 D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"
 buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
@@ -22,21 +22,31 @@ def http_json(url):
  with urllib.request.urlopen(url,timeout=15) as r:return json.loads(r.read())
 
 async def load_meta():
- # Load OKX SWAP contract values dynamically for every tracked symbol.
- # OKX trade sz is contract count, so ctVal converts it to base quantity.
- try:
-  x=await asyncio.to_thread(http_json,"https://www.okx.com/api/v5/public/instruments?instType=SWAP")
-  wanted={s.replace("USDT","-USDT-SWAP") for s in SYMBOLS}
-  for z in x.get("data",[]):
-   inst=z.get("instId")
-   if inst in wanted and z.get("ctVal"):
-    multipliers[("OKX",inst)]=float(z["ctVal"])*float(z.get("ctMult") or 1)
-  print("OKX CONTRACT META API OK",len([k for k in multipliers if k[0]=="OKX"]),"/",len(wanted))
- except Exception as e:
-  print("OKX META API ERROR",repr(e))
-  # Safe fallback for the original majors only; unknown contracts are skipped rather than mis-sized.
-  for inst,val in {"BTC-USDT-SWAP":0.01,"ETH-USDT-SWAP":0.1,"SOL-USDT-SWAP":1.0,"XRP-USDT-SWAP":100.0}.items():
-   multipliers[("OKX",inst)]=val
+ # V3.8: query OKX metadata per instrument. This is more robust than relying on one bulk response.
+ # OKX SWAP trade sz is contract count; base quantity = sz * ctVal * ctMult when ctValCcy is base coin.
+ okx_ok=0; okx_skip=[]
+ for s in SYMBOLS:
+  inst=s.replace("USDT","-USDT-SWAP")
+  try:
+   url=f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst}"
+   x=await asyncio.to_thread(http_json,url)
+   rows=x.get("data",[])
+   z=next((r for r in rows if r.get("instId")==inst),None)
+   if not z: raise ValueError("instrument not returned")
+   cv=float(z.get("ctVal") or 0); cm=float(z.get("ctMult") or 1)
+   ccy=(z.get("ctValCcy") or "").upper()
+   base=s[:-4]
+   if cv<=0: raise ValueError("missing ctVal")
+   # Our add() expects base-coin quantity. For USDT linear swaps ctValCcy should be the base coin.
+   if ccy and ccy not in (base,"USD"):
+    raise ValueError(f"unexpected ctValCcy={ccy}")
+   multipliers[("OKX",inst)]=cv*cm
+   okx_ok+=1
+  except Exception as e:
+   okx_skip.append(s)
+   print("OKX META SKIP",s,repr(e))
+ print("OKX CONTRACT META V3.8",okx_ok,"/",len(SYMBOLS),"loaded","skipped="+",".join(okx_skip) if okx_skip else "all-ok")
+
  # Gate metadata remains unchanged.
  for s in SYMBOLS:
   try:
@@ -278,7 +288,7 @@ def fast_setup(s):
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.7 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
+  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.8 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -302,7 +312,7 @@ async def report():
   outcomes()
 
 async def main():
- print("FLOW RADAR V3.7 STARTED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
+ print("FLOW RADAR V3.8 STARTED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
  await load_meta()
  tasks=[report()]
  for s in SYMBOLS:
