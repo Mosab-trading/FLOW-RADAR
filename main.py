@@ -5,6 +5,7 @@ import websockets
 
 SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",")]
 ALT_CORE=[x.strip().upper() for x in os.getenv("ALT_CORE","APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",") if x.strip()]
+ALT_MIN_AVG_USD=float(os.getenv("ALT_MIN_AVG_USD","5000")); ALT_MIN_AVG_FEEDS=float(os.getenv("ALT_MIN_AVG_FEEDS","2"))
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
 D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"
 buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
@@ -21,17 +22,21 @@ def http_json(url):
  with urllib.request.urlopen(url,timeout=15) as r:return json.loads(r.read())
 
 async def load_meta():
- # OKX USDT-SWAP contract multipliers for the four symbols tracked by this build.
- # Avoids Railway REST/WS metadata failures; SWAP trade sz is contract count.
- okx_ctval={
-  "BTC-USDT-SWAP":0.01,
-  "ETH-USDT-SWAP":0.1,
-  "SOL-USDT-SWAP":1.0,
-  "XRP-USDT-SWAP":100.0,
- }
- for inst,val in okx_ctval.items():
-  multipliers[("OKX",inst)]=val
- print("OKX CONTRACT META LOCAL OK",len(okx_ctval))
+ # Load OKX SWAP contract values dynamically for every tracked symbol.
+ # OKX trade sz is contract count, so ctVal converts it to base quantity.
+ try:
+  x=await asyncio.to_thread(http_json,"https://www.okx.com/api/v5/public/instruments?instType=SWAP")
+  wanted={s.replace("USDT","-USDT-SWAP") for s in SYMBOLS}
+  for z in x.get("data",[]):
+   inst=z.get("instId")
+   if inst in wanted and z.get("ctVal"):
+    multipliers[("OKX",inst)]=float(z["ctVal"])*float(z.get("ctMult") or 1)
+  print("OKX CONTRACT META API OK",len([k for k in multipliers if k[0]=="OKX"]),"/",len(wanted))
+ except Exception as e:
+  print("OKX META API ERROR",repr(e))
+  # Safe fallback for the original majors only; unknown contracts are skipped rather than mis-sized.
+  for inst,val in {"BTC-USDT-SWAP":0.01,"ETH-USDT-SWAP":0.1,"SOL-USDT-SWAP":1.0,"XRP-USDT-SWAP":100.0}.items():
+   multipliers[("OKX",inst)]=val
  # Gate metadata remains unchanged.
  for s in SYMBOLS:
   try:
@@ -212,6 +217,10 @@ def alt_breadth(secs):
   r=[x for x in flow_history[s] if n-x["ts"]<=secs]
   if len(r)<3 or not r[0]["p"]: continue
   cum=sum(x["d"] for x in r); tb=sum(x["gbuy"] for x in r); ts=sum(x["gsell"] for x in r); tot=tb+ts
+  avg_usd=tot/len(r) if r else 0
+  avg_feeds=sum(x["vbuy"]+x["vsell"] for x in r)/len(r) if r else 0
+  # Exclude thin/incomplete symbols so a few tiny trades cannot distort breadth.
+  if avg_usd<ALT_MIN_AVG_USD or avg_feeds<ALT_MIN_AVG_FEEDS: continue
   wimb=cum/tot*100 if tot else 0
   ret=(r[-1]["p"]/r[0]["p"]-1)*100
   side="BUY" if wimb>=15 else "SELL" if wimb<=-15 else "NEUTRAL"
@@ -269,7 +278,7 @@ def fast_setup(s):
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.5 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
+  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V3.7 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -288,10 +297,12 @@ async def report():
    setup=fast_setup(s)
    if setup: print(" "+setup)
    detect(s)
+  print("\n "+alt_breadth(30))
+  print(" "+alt_breadth(60))
   outcomes()
 
 async def main():
- print("FLOW RADAR V3.6 STARTED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
+ print("FLOW RADAR V3.7 STARTED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
  await load_meta()
  tasks=[report()]
  for s in SYMBOLS:
