@@ -3,7 +3,8 @@ from collections import defaultdict,deque
 from pathlib import Path
 import websockets
 
-SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT").split(",")]
+SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",")]
+ALT_CORE=[x.strip().upper() for x in os.getenv("ALT_CORE","APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",") if x.strip()]
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
 D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"
 buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
@@ -204,6 +205,31 @@ def confirm(s,secs):
          f"| agreement={agreement*100:.0f}% | spotFut={'YES' if aligned else 'NO'} "
          f"| priceMove={move:+.3f}% | priceConfirm={'YES' if priceok else 'NO'}")
 
+
+def alt_breadth(secs):
+ n=time.time(); rows=[]
+ for s in ALT_CORE:
+  r=[x for x in flow_history[s] if n-x["ts"]<=secs]
+  if len(r)<3 or not r[0]["p"]: continue
+  cum=sum(x["d"] for x in r); tb=sum(x["gbuy"] for x in r); ts=sum(x["gsell"] for x in r); tot=tb+ts
+  wimb=cum/tot*100 if tot else 0
+  ret=(r[-1]["p"]/r[0]["p"]-1)*100
+  side="BUY" if wimb>=15 else "SELL" if wimb<=-15 else "NEUTRAL"
+  rows.append((s,side,ret,wimb))
+ br=[x for x in flow_history["BTCUSDT"] if n-x["ts"]<=secs]
+ btc_ret=(br[-1]["p"]/br[0]["p"]-1)*100 if len(br)>=3 and br[0]["p"] else 0.0
+ if not rows:return f"ALT BREADTH {secs}s WARMING | valid=0/{len(ALT_CORE)}"
+ buys=sum(x[1]=="BUY" for x in rows); sells=sum(x[1]=="SELL" for x in rows); neuts=len(rows)-buys-sells
+ rets=sorted(x[2] for x in rows); median=rets[len(rets)//2] if len(rets)%2 else (rets[len(rets)//2-1]+rets[len(rets)//2])/2
+ out=sum(x[2]>btc_ret for x in rows); pos=sum(x[2]>0 for x in rows); opp=sum((x[2]>0 and btc_ret<0) or (x[2]<0 and btc_ret>0) for x in rows)
+ bp=buys/len(rows)*100; sp=sells/len(rows)*100
+ regime="BROAD ALT BUYING" if bp>=65 and sp<=25 else "BROAD ALT SELLING" if sp>=65 and bp<=25 else "MIXED/ROTATION"
+ rs=median-btc_ret
+ return (f"ALT BREADTH {secs}s {regime} | valid={len(rows)}/{len(ALT_CORE)} "
+         f"| BUY={buys}({bp:.0f}%) SELL={sells}({sp:.0f}%) NEUTRAL={neuts} "
+         f"| altMedian={median:+.3f}% BTC={btc_ret:+.3f}% RS={rs:+.3f}% "
+         f"| outperformBTC={out}/{len(rows)} positive={pos}/{len(rows)} oppositeBTC={opp}/{len(rows)}")
+
 def fast_setup(s):
  """Report-only entry candidate. Does not place trades or change raw EVENT logic."""
  n=time.time(); r=[x for x in flow_history[s] if n-x["ts"]<=15]
@@ -265,7 +291,7 @@ async def report():
   outcomes()
 
 async def main():
- print("FLOW RADAR V3.5 STARTED | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
+ print("FLOW RADAR V3.6 STARTED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
  await load_meta()
  tasks=[report()]
  for s in SYMBOLS:
