@@ -12,6 +12,7 @@ PREMOVE_SCAN_SECONDS=int(os.getenv("PREMOVE_SCAN_SECONDS","15")); PREMOVE_MIN_SC
 PREMOVE_STRONG_SCORE=float(os.getenv("PREMOVE_STRONG_SCORE","72")); PREMOVE_MIN_24H_QUOTE=float(os.getenv("PREMOVE_MIN_24H_QUOTE","5000000"))
 PREMOVE_QUIET_5M=float(os.getenv("PREMOVE_QUIET_5M","1.25")); PREMOVE_MAX_15M=float(os.getenv("PREMOVE_MAX_15M","2.25")); PREMOVE_MAX_1H=float(os.getenv("PREMOVE_MAX_1H","4.50"))
 PREMOVE_STATE=defaultdict(lambda:deque(maxlen=12)); PREMOVE_MARKET={}; PREMOVE_LAST_PRINT=0.0
+VENUE_AVAILABLE=defaultdict(set)  # symbol -> available venue families
 TRADFI_BASES={x.strip().upper() for x in os.getenv("PREMOVE_TRADFI_BASES","AAPL,AMZN,GOOG,GOOGL,META,MSFT,NVDA,TSLA,COIN,MSTR,SPX,SP500,NDX,NASDAQ,DJI,DOW,XAU,XAG,GOLD,SILVER,WTI,BRENT").split(",") if x.strip()}
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
 D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"; SCORES=D/"flow_scores.csv"; CALIB=D/"flow_score_regime_calibration.csv"
@@ -49,6 +50,7 @@ async def load_binance_universe():
   SYMBOLS=sorted(set(dyn),key=lambda x:(x not in ("BTCUSDT","ETHUSDT"),-qv.get(x,0)))
  except Exception as e: print("PREMOVE UNIVERSE ERROR",repr(e))
  ALT_CORE=[x for x in SYMBOLS if x not in ("BTCUSDT","ETHUSDT")]
+ for x in SYMBOLS: VENUE_AVAILABLE[x].add("BINANCE")
  print(f"PREMOVE UNIVERSE | total={len(SYMBOLS)} altCandidates={len(ALT_CORE)}")
 
 def futures_json(path):return http_json("https://fapi.binance.com"+path)
@@ -107,7 +109,8 @@ def premove_candidate(sym):
  if rs>=.6:reasons.append("RS-vs-BTC")
  if oi is not None and side*oi>0:reasons.append("OI-confirm")
  if fr is not None and fs>=.7:reasons.append("funding-ok")
- return dict(symbol=sym,side=word,status=status,score=score,same=same,w30=a["wimb"],w60=b["wimb"],m30=a["move"],m60=b["move"],rs=rs60,oi=oi,fr=fr,k=k,reasons=",".join(reasons) or "weak-evidence")
+ vc,vset=venue_coverage(sym)
+ return dict(symbol=sym,side=word,status=status,score=score,same=same,w30=a["wimb"],w60=b["wimb"],m30=a["move"],m60=b["move"],rs=rs60,oi=oi,fr=fr,k=k,venues=vc,venue_names="/".join(sorted(vset)),reasons=",".join(reasons) or "weak-evidence")
 
 def print_premove_top():
  global PREMOVE_LAST_PRINT
@@ -117,7 +120,43 @@ def print_premove_top():
  print(f"\n=== PREMOVE TOP {PREMOVE_TOP_N} | SCANNER-ONLY | NO ORDER ROUTING ===")
  for i,q in enumerate(rows[:PREMOVE_TOP_N],1):
   oi="N/A" if q["oi"] is None else f"{q['oi']:+.2f}%"; fr="N/A" if q["fr"] is None else f"{q['fr']:+.4f}%"
-  print(f" PREMOVE #{i:02d} {q['symbol']} {q['status']} {q['side']} score={q['score']:.1f} persistCycles={q['same']}/{PREMOVE_MIN_PERSIST} | wIMB30={q['w30']:+.1f}% wIMB60={q['w60']:+.1f}% | px30={q['m30']:+.3f}% px60={q['m60']:+.3f}% | 5m={q['k']['r5']:+.3f}% 15m={q['k']['r15']:+.3f}% 1h={q['k']['r60']:+.3f}% | RS60={q['rs']:+.3f}% OI={oi} funding={fr} | {q['reasons']}")
+  print(f" PREMOVE #{i:02d} {q['symbol']} {q['status']} {q['side']} score={q['score']:.1f} VENUES={q['venues']}/4[{q['venue_names']}] persistCycles={q['same']}/{PREMOVE_MIN_PERSIST} | wIMB30={q['w30']:+.1f}% wIMB60={q['w60']:+.1f}% | px30={q['m30']:+.3f}% px60={q['m60']:+.3f}% | 5m={q['k']['r5']:+.3f}% 15m={q['k']['r15']:+.3f}% 1h={q['k']['r60']:+.3f}% | RS60={q['rs']:+.3f}% OI={oi} funding={fr} | {q['reasons']}")
+
+
+async def discover_bybit():
+ """Discover Bybit linear USDT symbols without blocking PREMOVE startup."""
+ try:
+  cursor=""
+  found=set()
+  for _ in range(10):
+   url="https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
+   if cursor:url+="&cursor="+urllib.parse.quote(cursor)
+   x=await asyncio.to_thread(http_json,url)
+   result=x.get("result",{}) or {}
+   for z in result.get("list",[]) or []:
+    sym=str(z.get("symbol") or "").upper()
+    if sym in SYMBOLS and str(z.get("status") or "").lower()=="trading": found.add(sym)
+   cursor=result.get("nextPageCursor") or ""
+   if not cursor:break
+  for sym in found:VENUE_AVAILABLE[sym].add("BYBIT")
+  print("BYBIT DISCOVERY",len(found),"/",len(SYMBOLS))
+ except Exception as e:print("BYBIT DISCOVERY FAILED",repr(e))
+
+async def venue_metadata_background():
+ """Load optional exchange metadata in background; never blocks PREMOVE/Binance startup."""
+ await asyncio.gather(load_meta(),discover_bybit(),return_exceptions=True)
+ print("VENUE DISCOVERY READY | coverage known for",len(VENUE_AVAILABLE),"symbols")
+
+def venue_coverage(sym):
+ # Count venue families with either discovered metadata or recent actual trade data.
+ fam=set(VENUE_AVAILABLE.get(sym,set()))
+ for t in list(buf[sym])[-5000:]:
+  ex=str(t.get("ex",""))
+  if ex.startswith("BINANCE"):fam.add("BINANCE")
+  elif ex.startswith("BYBIT"):fam.add("BYBIT")
+  elif ex.startswith("OKX"):fam.add("OKX")
+  elif ex.startswith("GATE"):fam.add("GATE")
+ return len(fam),fam
 
 async def load_meta():
  # V3.9: OKX REST may return HTTP 403 from cloud IPs. Try REST first, then the public
@@ -159,7 +198,7 @@ async def load_meta():
    if cv<=0: raise ValueError("missing ctVal")
    if ccy and ccy not in (base,"USD"):
     raise ValueError(f"unexpected ctValCcy={ccy}")
-   multipliers[("OKX",inst)]=cv*cm; okx_ok+=1
+   multipliers[("OKX",inst)]=cv*cm; VENUE_AVAILABLE[sym].add("OKX"); okx_ok+=1
    print("OKX META OK",sym,inst,"ctVal=",cv,"ctMult=",cm,"mult=",cv*cm,"ccy=",ccy)
   except Exception as e:
    okx_skip.append(sym); print("OKX META SKIP",sym,repr(e))
@@ -176,7 +215,7 @@ async def load_meta():
   try:
    c=s.replace("USDT","_USDT")
    x=await asyncio.to_thread(http_json,f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{c}")
-   multipliers[("GATE",c)]=float(x["quanto_multiplier"])
+   multipliers[("GATE",c)]=float(x["quanto_multiplier"]); VENUE_AVAILABLE[s].add("GATE")
   except Exception as e: print("GATE META SKIP",s,repr(e))
 
 async def binance(s,spot):
@@ -622,7 +661,7 @@ async def telegram_reporter_tick():
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== MOMENTUM | FLOW RADAR V5.0 | {W}s | FLOW CONFIRM ===")
+  await asyncio.sleep(5);print(f"\n=== MOMENTUM | FLOW RADAR V5.1 | {W}s | FLOW CONFIRM ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -651,20 +690,18 @@ async def report():
   await telegram_reporter_tick()
   outcomes(); score_outcomes()
 async def main():
- print("FLOW RADAR V5.0 STARTED | MOMENTUM + PREMOVE | DYNAMIC BINANCE USD-M CRYPTO PERPS | READ-ONLY | PREMOVE NO ORDER ROUTING")
+ print("FLOW RADAR V5.1 STARTED | MOMENTUM + PREMOVE | 4-VENUE FLOW | NON-BLOCKING METADATA | READ-ONLY | PREMOVE NO ORDER ROUTING")
  await load_binance_universe()
- await load_meta()
+ # Optional exchange metadata runs in background so PREMOVE starts immediately.
  if TG_TOKEN and TG_CHAT_ID:
   ok=await telegram_send("FLOW RADAR TELEGRAM REPORTER ONLINE - waiting for 30s/60s warm-up.")
   print("TELEGRAM STARTUP TEST OK" if ok else "TELEGRAM STARTUP TEST FAILED")
  else:
   print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
- tasks=[report(),refresh_premove_market()]
- venue_mode=os.getenv("PREMOVE_VENUES","BINANCE").upper()
+ tasks=[report(),refresh_premove_market(),venue_metadata_background()]
+ # Keep all four venue families. Unsupported contracts reconnect harmlessly; discovered
+ # metadata/actual trades are reflected in VENUES x/4 instead of blocking the scanner.
  for s in SYMBOLS:
-  tasks += [binance(s,1),binance(s,0)]
-  if "BYBIT" in venue_mode:tasks += [bybit(s,1),bybit(s,0)]
-  if "OKX" in venue_mode:tasks += [okx(s,1),okx(s,0)]
-  if "GATE" in venue_mode:tasks += [gate(s,1),gate(s,0)]
+  tasks += [binance(s,1),binance(s,0),bybit(s,1),bybit(s,0),okx(s,1),okx(s,0),gate(s,1),gate(s,0)]
  await asyncio.gather(*tasks)
 asyncio.run(main())
