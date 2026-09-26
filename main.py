@@ -2,6 +2,18 @@ import asyncio,json,os,time,csv,urllib.request
 from collections import defaultdict,deque
 from pathlib import Path
 import websockets
+import aiohttp
+
+# Telegram reporter config
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_REGIME_ENABLED", "true").lower() == "true"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_HOURLY_SUMMARY = os.getenv("TELEGRAM_HOURLY_SUMMARY", "false").lower() == "true"
+TELEGRAM_MATERIAL_THRESHOLD = float(os.getenv("TELEGRAM_MATERIAL_THRESHOLD", "0.15"))  # 15% relative change
+
+# Telegram state tracking (no order state, regime-only)
+telegram_regime_state = {"name": None, "btc30": None, "btc60": None, "net": None, "rs": None, "last_send_ts": 0}
+telegram_summary_last_ts = 0
 
 SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",")]
 ALT_CORE=[x.strip().upper() for x in os.getenv("ALT_CORE","APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",") if x.strip()]
@@ -443,10 +455,158 @@ def fast_setup(s):
          f"| weightedIMB={wimb:+.1f}% | agreement={agreement*100:.0f}% "
          f"| spotFut=YES | REPORT-ONLY")
 
+async def fetch_market_context():
+    """Fetch BTC price, market cap dominance, and 24h change from CoinGecko. Never crash; return None on any failure."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
+            async with sess.get("https://api.coingecko.com/api/v3/global", headers={"User-Agent": "FlowRadar/4.1"}) as r:
+                if r.status != 200: return None
+                x = await r.json()
+                data = x.get("data", {})
+                return {
+                    "btc_price": data.get("btc_current_price", {}).get("usd"),
+                    "btc_dominance": data.get("btc_market_cap_percentage", {}).get("btc"),
+                    "market_24h_change": data.get("market_cap_change_percentage_24h_usd")
+                }
+    except Exception as e:
+        print(f"TELEGRAM MARKET CONTEXT FETCH ERROR: {repr(e)}")
+        return None
+
+async def telegram_send(text):
+    """Send message to Telegram. On failure, log and return; never crash or block report loop."""
+    if not (TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
+            async with sess.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}) as r:
+                if r.status != 200:
+                    print(f"TELEGRAM SEND FAILED: HTTP {r.status}")
+                else:
+                    print("TELEGRAM SENT")
+    except Exception as e:
+        print(f"TELEGRAM SEND ERROR: {repr(e)}")
+
+def regime_classifier(mr):
+    """Classify regime into GREEN/YELLOW/ORANGE/RED conservatively.
+    - RED: BEAR + sustained 30s+60s selling + negative RS + meaningful valid count + BTC weakness
+    - GREEN: BULL + sustained 30s+60s improvement + positive RS + breadth support + BTC strength
+    - YELLOW/ORANGE: Intermediate states, favoring caution
+    """
+    name = mr.get("name", "WARMING")
+    btc30 = mr.get("btc30", 0)
+    btc60 = mr.get("btc60", 0)
+    net = mr.get("net", 0)
+    rs = mr.get("rs", 0)
+    
+    # Require both 30s and 60s data
+    if btc30 is None or btc60 is None: return "WARMING"
+    
+    is_bull = name == "BULL"
+    is_bear = name == "BEAR"
+    is_sideways = name == "SIDEWAYS"
+    
+    # RED: bear market with sustained selling, negative RS, BTC down
+    if is_bear and btc30 < -0.05 and btc60 < -0.05 and net <= -0.3 and rs <= -1.0:
+        return "RED"
+    
+    # GREEN: bull market with sustained gains, positive RS, BTC up
+    if is_bull and btc30 > 0.05 and btc60 > 0.05 and net >= 0.3 and rs >= 1.0:
+        return "GREEN"
+    
+    # YELLOW: bull but breadth/RS weak; or sideways with bullish tilt
+    if (is_bull and (net < 0.3 or rs < 1.0)) or (is_sideways and btc30 > 0 and net > 0):
+        return "YELLOW"
+    
+    # ORANGE: sideways or weakening bull
+    if is_sideways or (is_bull and btc30 < 0):
+        return "ORANGE"
+    
+    return "YELLOW"  # default
+
+async def telegram_regime_reporter():
+    """Send regime change and hourly summary to Telegram. Non-blocking; failures logged only."""
+    global telegram_regime_state, telegram_summary_last_ts
+    
+    n = time.time()
+    mr = market_regime()
+    ctx = await fetch_market_context()
+    
+    # Detect meaningful change: name changes OR any metric moves > material_threshold relative
+    changed = False
+    if mr.get("name") != telegram_regime_state["name"]:
+        changed = True
+    else:
+        # Check for material changes in metrics
+        for key in ("btc30", "btc60", "net", "rs"):
+            old = telegram_regime_state.get(key, 0) or 0
+            new = mr.get(key, 0) or 0
+            if old != 0 and abs((new - old) / old) > TELEGRAM_MATERIAL_THRESHOLD:
+                changed = True
+                break
+    
+    # Send on change
+    if changed:
+        color = regime_classifier(mr)
+        emoji = {"GREEN": "🟢", "YELLOW": "🟡", "ORANGE": "🟠", "RED": "🔴"}.get(color, "⚪")
+        
+        old_color = telegram_regime_state["name"] or "INIT"
+        msg = f"{emoji} <b>REGIME: {color}</b> ({old_color} → {color})\n\n"
+        msg += f"📊 <b>BTC</b>: {ctx.get('btc_price', 'N/A') if ctx else 'N/A'} USD | 30s: {mr.get('btc30', 0):+.3f}% | 60s: {mr.get('btc60', 0):+.3f}%\n"
+        msg += f"📈 <b>Breadth (60s)</b>: Net={mr.get('net', 0):+.2f} | RS={mr.get('rs', 0):+.2f}%\n"
+        
+        if ctx:
+            msg += f"🌐 <b>Market</b>: BTC Dominance={ctx.get('btc_dominance', 0):+.1f}% | 24h Change={ctx.get('market_24h_change', 0):+.1f}%\n"
+        
+        msg += f"\n⚠️ <i>Direction is NOT certain; use as context only.</i>"
+        
+        await telegram_send(msg)
+        
+        # Update state
+        telegram_regime_state = {
+            "name": mr.get("name"),
+            "btc30": mr.get("btc30"),
+            "btc60": mr.get("btc60"),
+            "net": mr.get("net"),
+            "rs": mr.get("rs"),
+            "last_send_ts": n
+        }
+    
+    # Send hourly summary if enabled
+    if TELEGRAM_HOURLY_SUMMARY and n - telegram_summary_last_ts >= 3600:
+        color = regime_classifier(mr)
+        emoji = {"GREEN": "🟢", "YELLOW": "🟡", "ORANGE": "🟠", "RED": "🔴"}.get(color, "⚪")
+        
+        msg = f"{emoji} <b>HOURLY SUMMARY</b>\n\n"
+        msg += f"📊 <b>Market Regime</b>: {mr.get('name', 'WARMING')} → {color}\n"
+        msg += f"📊 <b>BTC</b>: 30s={mr.get('btc30', 0):+.3f}% | 60s={mr.get('btc60', 0):+.3f}%\n"
+        msg += f"📈 <b>Breadth</b>: Net={mr.get('net', 0):+.2f} | RS={mr.get('rs', 0):+.2f}%\n"
+        
+        if ctx:
+            msg += f"🌐 <b>Market</b>: BTC Dominance={ctx.get('btc_dominance', 0):+.1f}% | 24h Change={ctx.get('market_24h_change', 0):+.1f}%\n"
+        
+        msg += f"\n⚠️ <i>Direction is NOT certain; use as context only.</i>"
+        
+        await telegram_send(msg)
+        telegram_summary_last_ts = n
+
+async def telegram_startup_test():
+    """Send test message on startup if Telegram is configured. Safe to fail silently."""
+    if not (TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("TELEGRAM: disabled or incomplete config")
+        return
+    
+    msg = "🚀 <b>Flow Radar Started</b>\n\n✅ Telegram integration active. Market regime updates will follow."
+    await telegram_send(msg)
+
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
+ telegram_last_check=0
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V4.1 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
+  await asyncio.sleep(5);n=time.time();print(f"\n=== FLOW RADAR V4.1 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
+  if n-telegram_last_check>=60:
+   asyncio.create_task(telegram_regime_reporter())
+   telegram_last_check=n
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -476,6 +636,7 @@ async def report():
 async def main():
  print("FLOW RADAR V4.1 STARTED | REGIME + BASELINE + MFE/MAE CALIBRATION | FLOW SCORE UNCHANGED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
  await load_meta()
+ await telegram_startup_test()
  tasks=[report()]
  for s in SYMBOLS:
   tasks += [binance(s,1),binance(s,0),bybit(s,1),bybit(s,0),okx(s,1),okx(s,0),gate(s,1),gate(s,0)]
