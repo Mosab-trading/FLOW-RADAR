@@ -1,760 +1,932 @@
-import asyncio,json,os,time,csv,urllib.request,urllib.parse,math,threading
-from http.server import BaseHTTPRequestHandler,HTTPServer
-from collections import defaultdict,deque
-from pathlib import Path
-import websockets
-
-SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT").split(",") if x.strip()]
-ALT_CORE=[]
-ALT_MIN_AVG_USD=float(os.getenv("ALT_MIN_AVG_USD","1000")); ALT_MIN_AVG_FEEDS=float(os.getenv("ALT_MIN_AVG_FEEDS","2"))
-PREMOVE_ENABLED=os.getenv("PREMOVE_ENABLED","1").lower() not in ("0","false","no")
-PREMOVE_TOP_N=int(os.getenv("PREMOVE_TOP_N","10")); PREMOVE_MIN_PERSIST=int(os.getenv("PREMOVE_MIN_PERSIST","3"))
-PREMOVE_SCAN_SECONDS=int(os.getenv("PREMOVE_SCAN_SECONDS","15")); PREMOVE_MIN_SCORE=float(os.getenv("PREMOVE_MIN_SCORE","58"))
-PREMOVE_STRONG_SCORE=float(os.getenv("PREMOVE_STRONG_SCORE","72")); PREMOVE_MIN_24H_QUOTE=float(os.getenv("PREMOVE_MIN_24H_QUOTE","5000000"))
-PREMOVE_QUIET_5M=float(os.getenv("PREMOVE_QUIET_5M","1.25")); PREMOVE_MAX_15M=float(os.getenv("PREMOVE_MAX_15M","2.25")); PREMOVE_MAX_1H=float(os.getenv("PREMOVE_MAX_1H","4.50"))
-PREMOVE_STATE=defaultdict(lambda:deque(maxlen=12)); PREMOVE_MARKET={}; PREMOVE_LAST_PRINT=0.0
-MOMENTUM_VERBOSE=os.getenv("MOMENTUM_VERBOSE","0").lower() in ("1","true","yes")
-VENUE_VERBOSE=os.getenv("VENUE_VERBOSE","0").lower() in ("1","true","yes")
-VENUE_AVAILABLE=defaultdict(set)  # symbol -> available venue families
-OKX_SPOT_SUPPORTED=set()
-OKX_FUT_SUPPORTED=set()
-OKX_DISCOVERY_READY=asyncio.Event()
-TRADFI_BASES={x.strip().upper() for x in os.getenv("PREMOVE_TRADFI_BASES","AAPL,AMZN,GOOG,GOOGL,META,MSFT,NVDA,TSLA,COIN,MSTR,SPX,SP500,NDX,NASDAQ,DJI,DOW,XAU,XAG,GOLD,SILVER,WTI,BRENT").split(",") if x.strip()}
-W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
-D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"; SCORES=D/"flow_scores.csv"; CALIB=D/"flow_score_regime_calibration.csv"
-buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
-# V3.5 diagnostic confirmation layer; original EVENT/RESULT logic remains unchanged.
-flow_history=defaultdict(lambda:deque(maxlen=120))
-setup_last={}
-score_pending=[]; score_last={}
-
-def add(ex,s,p,base_qty,side,ts):
- usd=p*base_qty
- t={"ts":ts,"ex":ex,"s":s,"p":p,"qty":base_qty,"usd":usd,"side":side};buf[s].append(t)
- with RAW.open("a") as f:f.write(json.dumps(t,separators=(",",":"))+"\n")
-
-def http_json(url):
- req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 FlowRadar/3.9","Accept":"application/json"})
- with urllib.request.urlopen(req,timeout=15) as r:return json.loads(r.read())
-
-
-def is_crypto_perp(z):
- sym=str(z.get("symbol") or "").upper(); base=str(z.get("baseAsset") or "").upper()
- if not sym.endswith("USDT") or z.get("quoteAsset")!="USDT" or z.get("contractType")!="PERPETUAL" or z.get("status")!="TRADING": return False
- if base in TRADFI_BASES:return False
- return not any(k in (base+" "+sym) for k in ("STOCK","INDEX","GOLD","SILVER","NASDAQ","SP500"))
-
-async def load_binance_universe():
- global SYMBOLS,ALT_CORE
- try:
-  info=await asyncio.to_thread(http_json,"https://fapi.binance.com/fapi/v1/exchangeInfo")
-  tick=await asyncio.to_thread(http_json,"https://fapi.binance.com/fapi/v1/ticker/24hr")
-  qv={str(x.get("symbol","")).upper():float(x.get("quoteVolume") or 0) for x in tick}
-  dyn=[x["symbol"].upper() for x in info.get("symbols",[]) if is_crypto_perp(x) and qv.get(x["symbol"].upper(),0)>=PREMOVE_MIN_24H_QUOTE]
-  for x in ("BTCUSDT","ETHUSDT"):
-   if x not in dyn:dyn.append(x)
-  SYMBOLS=sorted(set(dyn),key=lambda x:(x not in ("BTCUSDT","ETHUSDT"),-qv.get(x,0)))
- except Exception as e: print("PREMOVE UNIVERSE ERROR",repr(e))
- ALT_CORE=[x for x in SYMBOLS if x not in ("BTCUSDT","ETHUSDT")]
- for x in SYMBOLS: VENUE_AVAILABLE[x].add("BINANCE")
- print(f"PREMOVE UNIVERSE | total={len(SYMBOLS)} altCandidates={len(ALT_CORE)}")
-
-def futures_json(path):return http_json("https://fapi.binance.com"+path)
-
-def premove_rest_sync(sym):
- out={"k":{},"oi":None,"funding":None,"ts":time.time()}
- try:
-  a=futures_json("/fapi/v1/klines?symbol="+urllib.parse.quote(sym)+"&interval=1m&limit=61")
-  c=[float(x[4]) for x in a]; last=c[-1]
-  ret=lambda n:(last/c[-1-n]-1)*100
-  out["k"]={"r5":ret(5),"r15":ret(15),"r60":ret(60)}
- except Exception:pass
- try:
-  a=futures_json("/futures/data/openInterestHist?symbol="+urllib.parse.quote(sym)+"&period=5m&limit=4")
-  v=[float(x.get("sumOpenInterestValue") or 0) for x in a]
-  if len(v)>1 and v[0]>0:out["oi"]=(v[-1]/v[0]-1)*100
- except Exception:pass
- try:
-  out["funding"]=float(futures_json("/fapi/v1/premiumIndex?symbol="+urllib.parse.quote(sym)).get("lastFundingRate") or 0)*100
- except Exception:pass
- return out
-
-async def refresh_premove_market():
- sem=asyncio.Semaphore(10)
- async def one(x):
-  async with sem:return x,await asyncio.to_thread(premove_rest_sync,x)
- while 1:
-  try:PREMOVE_MARKET.update(dict(await asyncio.gather(*(one(x) for x in ALT_CORE))));print("PREMOVE REST REFRESH",len(PREMOVE_MARKET))
-  except Exception as e:print("PREMOVE REST ERROR",repr(e))
-  await asyncio.sleep(max(60,int(os.getenv("PREMOVE_REST_SECONDS","300"))))
-
-def premove_candidate(sym):
- if sym in ("BTCUSDT","ETHUSDT"):return None
- a,b=window_metrics(sym,30),window_metrics(sym,60); btc=window_metrics("BTCUSDT",60); md=PREMOVE_MARKET.get(sym,{})
- k=md.get("k") or {}
- if not a or not b or not k:return None
- side=1 if a["wimb"]+b["wimb"]>=0 else -1; word="LONG" if side>0 else "SHORT"
- pumped=abs(k["r5"])>PREMOVE_QUIET_5M or abs(k["r15"])>PREMOVE_MAX_15M or abs(k["r60"])>PREMOVE_MAX_1H
- w30=side*a["wimb"]; w60=side*b["wimb"]
- flow=max(0,min(1,(.55*w30+.45*w60)/55)); improve=max(0,min(1,(w30-w60+20)/40))
- persist=max(0,min(1,(a["persist"]+b["persist"])/1.44)); agree=max(0,min(1,(a["agreement"]+b["agreement"])/1.5))
- align=1 if a["aligned"] and b["aligned"] else .35 if a["aligned"] or b["aligned"] else 0
- early=max(0,min(1,(side*(.6*a["move"]+.4*b["move"])+.03)/.25))
- quiet=max(0,1-min(1,abs(k["r5"])/max(.01,PREMOVE_QUIET_5M)))
- rs60=side*(b["move"]-(btc["move"] if btc else 0)); rs=max(0,min(1,(rs60+.05)/.35))
- oi=md.get("oi"); fr=md.get("funding"); ois=.5 if oi is None else max(0,min(1,(side*oi+.15)))
- fs=.5 if fr is None else (1 if side*fr<=.01 else max(0,1-(side*fr-.01)/.08))
- score=100*(.23*flow+.10*improve+.14*persist+.12*agree+.10*align+.08*early+.08*quiet+.07*rs+.05*ois+.03*fs)
- h=PREMOVE_STATE[sym];h.append((side,score)); same=sum(1 for d,q in h if d==side and q>=PREMOVE_MIN_SCORE)
- status="REJECT" if pumped else ("EARLY_"+word+"_WATCH" if same>=PREMOVE_MIN_PERSIST and score>=PREMOVE_STRONG_SCORE else "NOT_CONFIRMED" if score>=PREMOVE_MIN_SCORE else "REJECT")
- reasons=[]
- if pumped:reasons.append("recent-expansion")
- if quiet>=.65:reasons.append("quiet")
- if improve>=.6:reasons.append("flow-improving")
- if align==1:reasons.append("spot+futures")
- if rs>=.6:reasons.append("RS-vs-BTC")
- if oi is not None and side*oi>0:reasons.append("OI-confirm")
- if fr is not None and fs>=.7:reasons.append("funding-ok")
- vc,vset=venue_coverage(sym)
- return dict(symbol=sym,side=word,status=status,score=score,same=same,w30=a["wimb"],w60=b["wimb"],m30=a["move"],m60=b["move"],rs=rs60,oi=oi,fr=fr,k=k,venues=vc,venue_names="/".join(sorted(vset)),reasons=",".join(reasons) or "weak-evidence")
-
-def print_premove_top():
- global PREMOVE_LAST_PRINT
- if not PREMOVE_ENABLED or time.time()-PREMOVE_LAST_PRINT<PREMOVE_SCAN_SECONDS:return
- PREMOVE_LAST_PRINT=time.time(); rows=[q for x in ALT_CORE if (q:=premove_candidate(x))]
- rows.sort(key=lambda q:(q["status"].startswith("EARLY_"),q["score"]),reverse=True)
- print(f"\n=== PREMOVE TOP {PREMOVE_TOP_N} | SCANNER-ONLY | NO ORDER ROUTING ===")
- for i,q in enumerate(rows[:PREMOVE_TOP_N],1):
-  oi="N/A" if q["oi"] is None else f"{q['oi']:+.2f}%"; fr="N/A" if q["fr"] is None else f"{q['fr']:+.4f}%"
-  print(f" PREMOVE #{i:02d} {q['symbol']} {q['status']} {q['side']} score={q['score']:.1f} VENUES={q['venues']}/4[{q['venue_names']}] persistCycles={q['same']}/{PREMOVE_MIN_PERSIST} | wIMB30={q['w30']:+.1f}% wIMB60={q['w60']:+.1f}% | px30={q['m30']:+.3f}% px60={q['m60']:+.3f}% | 5m={q['k']['r5']:+.3f}% 15m={q['k']['r15']:+.3f}% 1h={q['k']['r60']:+.3f}% | RS60={q['rs']:+.3f}% OI={oi} funding={fr} | {q['reasons']}")
-
-
-async def discover_bybit():
- """Discover Bybit linear USDT symbols without blocking PREMOVE startup."""
- try:
-  cursor=""
-  found=set()
-  for _ in range(10):
-   url="https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-   if cursor:url+="&cursor="+urllib.parse.quote(cursor)
-   x=await asyncio.to_thread(http_json,url)
-   result=x.get("result",{}) or {}
-   for z in result.get("list",[]) or []:
-    sym=str(z.get("symbol") or "").upper()
-    if sym in SYMBOLS and str(z.get("status") or "").lower()=="trading": found.add(sym)
-   cursor=result.get("nextPageCursor") or ""
-   if not cursor:break
-  for sym in found:VENUE_AVAILABLE[sym].add("BYBIT")
-  print("BYBIT DISCOVERY",len(found),"/",len(SYMBOLS))
- except Exception as e:print("BYBIT DISCOVERY FAILED",repr(e))
-
-async def venue_metadata_background():
- """Load optional exchange metadata in background; never blocks PREMOVE/Binance startup."""
- await asyncio.gather(load_meta(),discover_bybit(),return_exceptions=True)
- print("VENUE DISCOVERY READY | coverage known for",len(VENUE_AVAILABLE),"symbols")
-
-def venue_coverage(sym):
- # Count venue families with either discovered metadata or recent actual trade data.
- fam=set(VENUE_AVAILABLE.get(sym,set()))
- for t in list(buf[sym])[-5000:]:
-  ex=str(t.get("ex",""))
-  if ex.startswith("BINANCE"):fam.add("BINANCE")
-  elif ex.startswith("BYBIT"):fam.add("BYBIT")
-  elif ex.startswith("OKX"):fam.add("OKX")
-  elif ex.startswith("GATE"):fam.add("GATE")
- return len(fam),fam
-
-async def load_meta():
- # V3.9: OKX REST may return HTTP 403 from cloud IPs. Try REST first, then the public
- # WebSocket instruments snapshot (same OKX public WS already used successfully for trades).
- targets={s.replace("USDT","-USDT-SWAP"):s for s in SYMBOLS}
- okx_rows={}
- try:
-  x=await asyncio.to_thread(http_json,"https://www.okx.com/api/v5/public/instruments?instType=SWAP")
-  for z in x.get("data",[]):
-   if z.get("instId") in targets: okx_rows[z["instId"]]=z
-  print("OKX META REST",len(okx_rows),"/",len(targets))
- except Exception as e:
-  print("OKX META REST FAILED",repr(e),"-> WS fallback")
-
- if len(okx_rows)<len(targets):
-  try:
-   u="wss://ws.okx.com:8443/ws/v5/public"
-   async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
-    await w.send(json.dumps({"op":"subscribe","args":[{"channel":"instruments","instType":"SWAP"}]}))
-    deadline=time.time()+12
-    while time.time()<deadline and len(okx_rows)<len(targets):
-     try: r=await asyncio.wait_for(w.recv(),timeout=max(0.2,deadline-time.time()))
-     except asyncio.TimeoutError: break
-     x=json.loads(r)
-     if x.get("event")=="error":
-      print("OKX META WS ERROR",json.dumps(x,separators=(",",":"))[:500]);break
-     for z in x.get("data",[]):
-      if z.get("instId") in targets: okx_rows[z["instId"]]=z
-   print("OKX META WS",len(okx_rows),"/",len(targets))
-  except Exception as e: print("OKX META WS FAILED",repr(e))
-
- # Discover OKX SPOT separately. A futures contract existing on OKX does not mean
- # the corresponding spot market exists. This prevents unsupported subscriptions/reconnect storms.
- try:
-  sx=await asyncio.to_thread(http_json,"https://www.okx.com/api/v5/public/instruments?instType=SPOT")
-  wanted={s.replace("USDT","-USDT"):s for s in SYMBOLS}
-  for z in sx.get("data",[]):
-   inst=str(z.get("instId") or "")
-   state=str(z.get("state") or "live").lower()
-   if inst in wanted and state in ("live","trading"):
-    OKX_SPOT_SUPPORTED.add(wanted[inst])
-  print("OKX SPOT DISCOVERY",len(OKX_SPOT_SUPPORTED),"/",len(SYMBOLS))
- except Exception as e:
-  print("OKX SPOT DISCOVERY FAILED",repr(e))
-
- okx_ok=0; okx_skip=[]
- for inst,sym in targets.items():
-  try:
-   z=okx_rows.get(inst)
-   if not z: raise ValueError("instrument metadata not returned")
-   cv=float(z.get("ctVal") or 0); cm=float(z.get("ctMult") or 1)
-   ccy=(z.get("ctValCcy") or "").upper(); base=sym[:-4]
-   if cv<=0: raise ValueError("missing ctVal")
-   if ccy and ccy not in (base,"USD"):
-    raise ValueError(f"unexpected ctValCcy={ccy}")
-   multipliers[("OKX",inst)]=cv*cm; OKX_FUT_SUPPORTED.add(sym); VENUE_AVAILABLE[sym].add("OKX"); okx_ok+=1
-   VENUE_VERBOSE and print("OKX META OK",sym,inst,"ctVal=",cv,"ctMult=",cm,"mult=",cv*cm,"ccy=",ccy)
-  except Exception as e:
-   okx_skip.append(sym); VENUE_VERBOSE and print("OKX META SKIP",sym,repr(e))
- print("OKX CONTRACT META V3.9",okx_ok,"/",len(SYMBOLS),"loaded","skipped="+",".join(okx_skip) if okx_skip else "all-ok")
-
- # Safety fallback for the four original contracts only, preserving the original known values.
- fallback={"BTC-USDT-SWAP":0.01,"ETH-USDT-SWAP":0.1,"SOL-USDT-SWAP":1.0,"XRP-USDT-SWAP":100.0}
- for inst,m in fallback.items():
-  if ("OKX",inst) not in multipliers:
-   multipliers[("OKX",inst)]=m; VENUE_VERBOSE and print("OKX META FALLBACK",inst,"mult=",m)
-  sym=inst.replace("-USDT-SWAP","USDT")
-  if sym in SYMBOLS: OKX_FUT_SUPPORTED.add(sym); VENUE_AVAILABLE[sym].add("OKX")
-
- # Release OKX collectors now; Gate metadata can continue independently afterwards.
- OKX_DISCOVERY_READY.set()
- print("OKX SUPPORTED | spot=",len(OKX_SPOT_SUPPORTED),"futures=",len(OKX_FUT_SUPPORTED))
-
- # Gate metadata unchanged.
- for s in SYMBOLS:
-  try:
-   c=s.replace("USDT","_USDT")
-   x=await asyncio.to_thread(http_json,f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{c}")
-   multipliers[("GATE",c)]=float(x["quanto_multiplier"]); VENUE_AVAILABLE[s].add("GATE")
-  except Exception as e: VENUE_VERBOSE and print("GATE META SKIP",s,repr(e))
-
-async def binance(s,spot):
- ex="BINANCE_SPOT" if spot else "BINANCE_FUTURES"
- u=(f"wss://stream.binance.com:9443/ws/{s.lower()}@aggTrade" if spot else f"wss://fstream.binance.com/market/ws/{s.lower()}@aggTrade")
- while 1:
-  try:
-   async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
-    VENUE_VERBOSE and print(ex,"CONNECTED",s); first=True
-    async for r in w:
-     x=json.loads(r)
-     if first: VENUE_VERBOSE and print(ex,"DATA OK",s); first=False
-     p=float(x["p"]);q=float(x["q"]);add(ex,s,p,q,"SELL" if x.get("m") else "BUY",x.get("T",x.get("E",time.time()*1000))/1000)
-  except Exception as e: VENUE_VERBOSE and print(ex,"reconnect",s,repr(e)); await asyncio.sleep(3)
-
-async def bybit(s,spot):
- ex="BYBIT_SPOT" if spot else "BYBIT_FUTURES"; u="wss://stream.bybit.com/v5/public/"+("spot" if spot else "linear")
- while 1:
-  try:
-   async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
-    await w.send(json.dumps({"op":"subscribe","args":[f"publicTrade.{s}"]})); VENUE_VERBOSE and print(ex,"CONNECTED",s); first=True
-    async for r in w:
-     x=json.loads(r)
-     for z in x.get("data",[]):
-      if first: VENUE_VERBOSE and print(ex,"DATA OK",s); first=False
-      add(ex,s,float(z["p"]),float(z["v"]),"BUY" if z["S"]=="Buy" else "SELL",int(z["T"])/1000)
-  except Exception as e: VENUE_VERBOSE and print(ex,"reconnect",s,repr(e)); await asyncio.sleep(3)
-
-async def okx(s,spot):
- ex="OKX_SPOT" if spot else "OKX_FUTURES"; inst=s.replace("USDT","-USDT")+("" if spot else "-SWAP")
- # Wait for one metadata pass, then permanently skip unsupported OKX markets.
- # This avoids endless 30-second no-data reconnect loops without affecting PREMOVE scoring.
- await OKX_DISCOVERY_READY.wait()
- supported=OKX_SPOT_SUPPORTED if spot else OKX_FUT_SUPPORTED
- if s not in supported:
-  VENUE_VERBOSE and print(ex,"UNSUPPORTED SKIP",s,inst)
-  return
- u="wss://ws.okx.com:8443/ws/v5/public"
- channel="trades"
- while 1:
-  try:
-   async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
-    arg={"channel":channel,"instId":inst}
-    await w.send(json.dumps({"op":"subscribe","args":[arg]}))
-    VENUE_VERBOSE and print(ex,"CONNECTED",s,"channel="+channel,"instId="+inst)
-    first=True; diag=0
-    async for r in w:
-     x=json.loads(r)
-     if x.get("event") in ("subscribe","error"):
-      VENUE_VERBOSE and print(ex,"OKX RESPONSE",s,json.dumps(x,separators=(",",":"))[:1000])
-      continue
-     rows=x.get("data",[])
-     if not rows: continue
-     if diag<2:
-      VENUE_VERBOSE and print(ex,"RAW DATA",s,json.dumps(rows[0],separators=(",",":"))[:1000]);diag+=1
-     for z in rows:
-      p=float(z["px"]); q=float(z["sz"])
-      if not spot:
-       m=multipliers.get(("OKX",inst))
-       if not m:
-        VENUE_VERBOSE and print(ex,"SKIP NO ctVal",s,inst,"raw_sz="+str(z.get("sz")))
-        continue
-       q*=m
-      if first: VENUE_VERBOSE and print(ex,"DATA OK",s,"ctVal="+str(multipliers.get(("OKX",inst),"SPOT"))); first=False
-      add(ex,s,p,q,z["side"].upper(),int(z["ts"])/1000)
-  except Exception as e:
-   VENUE_VERBOSE and print(ex,"reconnect",s,repr(e));await asyncio.sleep(3)
-
-async def gate(s,spot):
- ex="GATE_SPOT" if spot else "GATE_FUTURES"; c=s.replace("USDT","_USDT")
- u="wss://api.gateio.ws/ws/v4/" if spot else "wss://fx-ws.gateio.ws/v4/ws/usdt"
- ch="spot.trades" if spot else "futures.trades"
- while 1:
-  try:
-   async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
-    await w.send(json.dumps({"time":int(time.time()),"channel":ch,"event":"subscribe","payload":[c]})); VENUE_VERBOSE and print(ex,"CONNECTED",s); first=True
-    async for r in w:
-     x=json.loads(r)
-     if x.get("event")!="update":continue
-     rows=x.get("result",[]); rows=rows if isinstance(rows,list) else [rows]
-     for z in rows:
-      if first: VENUE_VERBOSE and print(ex,"DATA OK",s); first=False
-      p=float(z["price"])
-      if spot:q=float(z["amount"]);side=z["side"].upper();ts=float(z.get("create_time_ms",time.time()*1000))/1000
-      else:
-       size=float(z["size"]);m=multipliers.get(("GATE",c))
-       if not m:continue
-       q=abs(size)*m;side="BUY" if size>0 else "SELL";ts=float(z.get("create_time_ms",time.time()*1000))/1000
-      add(ex,s,p,q,side,ts)
-  except Exception as e: VENUE_VERBOSE and print(ex,"reconnect",s,repr(e)); await asyncio.sleep(3)
-
-def flow(s,seconds=W,ex=None):
- n=time.time();b=se=0.;c=0
- for t in reversed(buf[s]):
-  if n-t["ts"]>seconds:break
-  if ex and t["ex"]!=ex:continue
-  c+=1
-  if t["side"]=="BUY":b+=t["usd"]
-  else:se+=t["usd"]
- tot=b+se;d=b-se;im=d/tot*100 if tot else 0
- return b,se,d,im,c
-
-def group(s,names):
- vals=[flow(s,W,x) for x in names];b=sum(x[0] for x in vals);se=sum(x[1] for x in vals);c=sum(x[4] for x in vals);tot=b+se;d=b-se;im=d/tot*100 if tot else 0
- return b,se,d,im,c
-
-def price(s):return buf[s][-1]["p"] if buf[s] else None
-
-def detect(s):
- b,se,d,im,c=flow(s);tot=b+se;n=time.time();direction="BUY" if d>0 else "SELL"
- if tot<MIN or abs(im)<IMB or n-last.get((s,direction),0)<COOL:return
- p=price(s)
- if not p:return
- last[(s,direction)]=n;pending.append({"ts":n,"s":s,"dir":direction,"entry":p,"b":b,"sell":se,"d":d,"im":im,"r":{}})
- MOMENTUM_VERBOSE and print(f"EVENT {s} {direction} entry={p} delta=${d:,.0f} imbalance={im:+.1f}%")
-
-def outcomes():
- n=time.time()
- for e in pending[:]:
-  for h in (5,30,60,300):
-   if str(h) not in e["r"] and n>=e["ts"]+h and price(e["s"]):e["r"][str(h)]=(price(e["s"])/e["entry"]-1)*100
-  if "300" in e["r"]:
-   new=not EVENTS.exists();r=e["r"]
-   with EVENTS.open("a",newline="") as f:
-    w=csv.writer(f)
-    if new:w.writerow(["time","symbol","direction","entry","buy_usd","sell_usd","delta","imbalance","ret5","ret30","ret60","ret300"])
-    w.writerow([e["ts"],e["s"],e["dir"],e["entry"],e["b"],e["sell"],e["d"],e["im"],r["5"],r["30"],r["60"],r["300"]])
-   MOMENTUM_VERBOSE and print(f'RESULT {e["s"]} {e["dir"]} 5s={r["5"]:+.3f}% 30s={r["30"]:+.3f}% 60s={r["60"]:+.3f}% 300s={r["300"]:+.3f}%');pending.remove(e)
-
-def remember_confirm(s,p,sd,fd,ad,ai,gbuy,gsell,vbuy,vsell):
- h=flow_history[s]; n=time.time()
- h.append({"ts":n,"p":p,"sd":sd,"fd":fd,"d":ad,"im":ai,
-           "gbuy":gbuy,"gsell":gsell,"vbuy":vbuy,"vsell":vsell})
- while h and n-h[0]["ts"]>70:h.popleft()
-
-def confirm(s,secs):
- n=time.time(); r=[x for x in flow_history[s] if n-x["ts"]<=secs]
- if len(r)<3:return f"FLOW CONFIRM {secs}s WARMING | samples={len(r)}"
-
- pos=sum(x["d"]>0 for x in r); neg=sum(x["d"]<0 for x in r)
- side="BUY" if pos>neg else "SELL" if neg>pos else "NEUTRAL"
- persist=max(pos,neg)/len(r)
-
- cum=sum(x["d"] for x in r)
- total_buy=sum(x["gbuy"] for x in r); total_sell=sum(x["gsell"] for x in r)
- total=total_buy+total_sell
- wimb=cum/total*100 if total else 0
-
- vbuy=sum(x["vbuy"] for x in r); vsell=sum(x["vsell"] for x in r)
- vtot=vbuy+vsell
- agreement=max(vbuy,vsell)/vtot if vtot else 0
- vote="BUY" if vbuy>vsell else "SELL" if vsell>vbuy else "NEUTRAL"
-
- spot=sum(x["sd"] for x in r); fut=sum(x["fd"] for x in r)
- aligned=(side=="BUY" and spot>0 and fut>0) or (side=="SELL" and spot<0 and fut<0)
-
- move=(r[-1]["p"]/r[0]["p"]-1)*100 if r[0]["p"] else 0
- priceok=(side=="BUY" and move>0) or (side=="SELL" and move<0)
-
- strong=side!="NEUTRAL" and persist>=.67 and abs(wimb)>=45 and agreement>=.67 and vote==side and aligned and priceok
- normal=side!="NEUTRAL" and persist>=.60 and abs(wimb)>=30 and agreement>=.60 and vote==side and priceok
-
- if strong: label="STRONG "+side
- elif normal: label=side
- elif side!="NEUTRAL" and persist>=.67 and abs(wimb)>=45 and vote==side and not priceok:
-  label=side+" ABSORPTION"
- else: label="NEUTRAL"
-
- return (f"FLOW CONFIRM {secs}s {label} | persistence={persist*100:.0f}% "
-         f"| cumDelta=${cum:,.0f} | weightedIMB={wimb:+.1f}% "
-         f"| agreement={agreement*100:.0f}% | spotFut={'YES' if aligned else 'NO'} "
-         f"| priceMove={move:+.3f}% | priceConfirm={'YES' if priceok else 'NO'}")
-
-
-def alt_breadth(secs):
- n=time.time(); rows=[]
- for s in ALT_CORE:
-  r=[x for x in flow_history[s] if n-x["ts"]<=secs]
-  if len(r)<3 or not r[0]["p"]: continue
-  cum=sum(x["d"] for x in r); tb=sum(x["gbuy"] for x in r); ts=sum(x["gsell"] for x in r); tot=tb+ts
-  avg_usd=tot/len(r) if r else 0
-  avg_feeds=sum(x["vbuy"]+x["vsell"] for x in r)/len(r) if r else 0
-  # Exclude thin/incomplete symbols so a few tiny trades cannot distort breadth.
-  if avg_usd<ALT_MIN_AVG_USD or avg_feeds<ALT_MIN_AVG_FEEDS: continue
-  wimb=cum/tot*100 if tot else 0
-  ret=(r[-1]["p"]/r[0]["p"]-1)*100
-  side="BUY" if wimb>=15 else "SELL" if wimb<=-15 else "NEUTRAL"
-  rows.append((s,side,ret,wimb))
- br=[x for x in flow_history["BTCUSDT"] if n-x["ts"]<=secs]
- btc_ret=(br[-1]["p"]/br[0]["p"]-1)*100 if len(br)>=3 and br[0]["p"] else 0.0
- if not rows:return f"ALT BREADTH {secs}s WARMING | valid=0/{len(ALT_CORE)}"
- buys=sum(x[1]=="BUY" for x in rows); sells=sum(x[1]=="SELL" for x in rows); neuts=len(rows)-buys-sells
- rets=sorted(x[2] for x in rows); median=rets[len(rets)//2] if len(rets)%2 else (rets[len(rets)//2-1]+rets[len(rets)//2])/2
- out=sum(x[2]>btc_ret for x in rows); pos=sum(x[2]>0 for x in rows); opp=sum((x[2]>0 and btc_ret<0) or (x[2]<0 and btc_ret>0) for x in rows)
- bp=buys/len(rows)*100; sp=sells/len(rows)*100
- regime="BROAD ALT BUYING" if bp>=65 and sp<=25 else "BROAD ALT SELLING" if sp>=65 and bp<=25 else "MIXED/ROTATION"
- rs=median-btc_ret
- return (f"ALT BREADTH {secs}s {regime} | valid={len(rows)}/{len(ALT_CORE)} "
-         f"| BUY={buys}({bp:.0f}%) SELL={sells}({sp:.0f}%) NEUTRAL={neuts} "
-         f"| altMedian={median:+.3f}% BTC={btc_ret:+.3f}% RS={rs:+.3f}% "
-         f"| outperformBTC={out}/{len(rows)} positive={pos}/{len(rows)} oppositeBTC={opp}/{len(rows)}")
-
-
-
-def window_metrics(s,secs):
- n=time.time(); r=[x for x in flow_history[s] if n-x["ts"]<=secs]
- if len(r)<3 or not r[0]["p"]: return None
- pos=sum(x["d"]>0 for x in r); neg=sum(x["d"]<0 for x in r)
- side="BUY" if pos>neg else "SELL" if neg>pos else "NEUTRAL"
- persist=max(pos,neg)/len(r)
- cum=sum(x["d"] for x in r); tb=sum(x["gbuy"] for x in r); ts=sum(x["gsell"] for x in r); tot=tb+ts
- wimb=cum/tot*100 if tot else 0
- vb=sum(x["vbuy"] for x in r); vs=sum(x["vsell"] for x in r); vt=vb+vs
- agreement=max(vb,vs)/vt if vt else 0
- vote="BUY" if vb>vs else "SELL" if vs>vb else "NEUTRAL"
- spot=sum(x["sd"] for x in r); fut=sum(x["fd"] for x in r)
- aligned=(side=="BUY" and spot>0 and fut>0) or (side=="SELL" and spot<0 and fut<0)
- move=(r[-1]["p"]/r[0]["p"]-1)*100
- priceok=(side=="BUY" and move>0) or (side=="SELL" and move<0)
- sign=1 if side=="BUY" else -1 if side=="SELL" else 0
- return {"side":side,"sign":sign,"persist":persist,"cum":cum,"wimb":wimb,"agreement":agreement,
-         "vote":vote,"aligned":aligned,"move":move,"priceok":priceok,"spot":spot,"fut":fut}
-
-def breadth_metrics(secs=60):
- n=time.time(); rows=[]
- for s in ALT_CORE:
-  r=[x for x in flow_history[s] if n-x["ts"]<=secs]
-  if len(r)<3 or not r[0]["p"]: continue
-  cum=sum(x["d"] for x in r); tb=sum(x["gbuy"] for x in r); ts=sum(x["gsell"] for x in r); tot=tb+ts
-  avg_usd=tot/len(r); avg_feeds=sum(x["vbuy"]+x["vsell"] for x in r)/len(r)
-  if avg_usd<ALT_MIN_AVG_USD or avg_feeds<ALT_MIN_AVG_FEEDS: continue
-  wimb=cum/tot*100 if tot else 0; ret=(r[-1]["p"]/r[0]["p"]-1)*100
-  rows.append((s,1 if wimb>=15 else -1 if wimb<=-15 else 0,ret))
- br=[x for x in flow_history["BTCUSDT"] if n-x["ts"]<=secs]
- btc=(br[-1]["p"]/br[0]["p"]-1)*100 if len(br)>=3 and br[0]["p"] else 0
- if not rows:return {"valid":0,"net":0,"rs":0,"positive":0}
- rets=sorted(x[2] for x in rows); med=rets[len(rets)//2] if len(rets)%2 else (rets[len(rets)//2-1]+rets[len(rets)//2])/2
- return {"valid":len(rows),"net":sum(x[1] for x in rows)/len(rows),"rs":med-btc,"positive":sum(x[2]>0 for x in rows)/len(rows)}
-
-def flow_score(s):
- """V4.0 report-only score. Range -100..+100; no order placement."""
- m15,m30,m60=window_metrics(s,15),window_metrics(s,30),window_metrics(s,60)
- if not all((m15,m30,m60)): return None
- # 35 pts: multi-window flow momentum. 60s gets the largest weight.
- flowpart=0
- for m,w in ((m15,7),(m30,12),(m60,16)):
-  strength=min(1.0,abs(m["wimb"])/45.0)*min(1.0,m["persist"]/.67)
-  flowpart += m["sign"]*w*strength
- # 20 pts: spot/futures + venue agreement, concentrated on 30/60s.
- conf=0
- for m,w in ((m30,8),(m60,12)):
-  if m["sign"]:
-   q=min(1.0,m["agreement"]/.67)*(1.0 if m["aligned"] else .35)
-   conf += m["sign"]*w*q
- # 15 pts: price confirmation; opposite price action is treated as absorption/divergence.
- pricepart=0
- for m,w in ((m30,6),(m60,9)):
-  if m["sign"]: pricepart += m["sign"]*w*(1 if m["priceok"] else -.45)
- # 15 pts: BTC regime modifier for alts only. BTC itself gets its own flow as the market context.
- btcpart=0
- if s!="BTCUSDT":
-  b30,b60=window_metrics("BTCUSDT",30),window_metrics("BTCUSDT",60)
-  if b30 and b60:
-   btcpart=7*b30["sign"]*min(1,abs(b30["wimb"])/45)+8*b60["sign"]*min(1,abs(b60["wimb"])/45)
- # 15 pts: alt breadth/relative strength modifier for alts.
- breadthpart=0; bm=breadth_metrics(60)
- if s!="BTCUSDT" and bm["valid"]>=3:
-  breadthpart=9*max(-1,min(1,bm["net"])) + 6*max(-1,min(1,bm["rs"]/.20))
- raw=flowpart+conf+pricepart+btcpart+breadthpart
- score=max(-100,min(100,round(raw)))
- if score>=65: regime="STRONG LONG"
- elif score>=35: regime="LONG BIAS"
- elif score<=-65: regime="STRONG SHORT"
- elif score<=-35: regime="SHORT BIAS"
- else: regime="NEUTRAL"
- return {"score":score,"regime":regime,"flow":round(flowpart,1),"confirm":round(conf,1),"price":round(pricepart,1),
-         "btc":round(btcpart,1),"breadth":round(breadthpart,1),"bvalid":bm["valid"],"rs":bm["rs"],
-         "m30":m30["side"],"m60":m60["side"]}
-
-def market_regime():
- """Calibration-only regime; FLOW SCORE itself is unchanged."""
- b30,b60=window_metrics("BTCUSDT",30),window_metrics("BTCUSDT",60); bm=breadth_metrics(60)
- if not b30 or not b60:return {"name":"WARMING","btc30":0.0,"btc60":0.0,"net":bm["net"],"rs":bm["rs"]}
- bull=b30["move"]>0 and b60["move"]>0 and b60["sign"]>=0 and bm["valid"]>=3 and bm["net"]>=0 and bm["rs"]>=0
- bear=b30["move"]<0 and b60["move"]<0 and b60["sign"]<=0 and bm["valid"]>=3 and bm["net"]<=0 and bm["rs"]<=0
- return {"name":"BULL" if bull else "BEAR" if bear else "SIDEWAYS","btc30":b30["move"],"btc60":b60["move"],"net":bm["net"],"rs":bm["rs"]}
-
-def calibration_baseline(regime,horizon):
- if not CALIB.exists():return None
- try:
-  vals=[]
-  with CALIB.open(newline="") as f:
-   for z in csv.DictReader(f):
-    if z.get("market_regime")==regime and z.get("ret"+str(horizon)) not in (None,""):vals.append(float(z["ret"+str(horizon)]))
-  if not vals:return None
-  return {"n":len(vals),"up":100*sum(v>0 for v in vals)/len(vals),"down":100*sum(v<0 for v in vals)/len(vals),"avg":sum(vals)/len(vals)}
- except Exception:return None
-
-def record_score(s,fs):
- n=time.time()
- if n-score_last.get(s,0)<15:return
- p=price(s)
- if not p:return
- mr=market_regime(); score_last[s]=n
- score_pending.append({"ts":n,"s":s,"p":p,"score":fs["score"],"regime":fs["regime"],"flow":fs["flow"],"confirm":fs["confirm"],"pricepart":fs["price"],"btc":fs["btc"],"breadth":fs["breadth"],"rs":fs["rs"],"market_regime":mr["name"],"regime_btc30":mr["btc30"],"regime_btc60":mr["btc60"],"regime_breadth":mr["net"],"regime_rs":mr["rs"],"r":{},"mfe":{},"mae":{},"best":0.0,"worst":0.0})
-
-def score_outcomes():
- n=time.time()
- for e in score_pending[:]:
-  p=price(e["s"])
-  if p:
-   raw=(p/e["p"]-1)*100; direction=1 if e["score"]>0 else -1 if e["score"]<0 else 0
-   if direction:
-    e["best"]=max(e["best"],raw*direction); e["worst"]=max(e["worst"],-raw*direction)
-  for h in (30,60,180,300,900):
-   if str(h) not in e["r"] and n>=e["ts"]+h and p:
-    e["r"][str(h)]=(p/e["p"]-1)*100; e["mfe"][str(h)]=max(0,e["best"]); e["mae"][str(h)]=max(0,e["worst"])
-  if "900" in e["r"]:
-   r=e["r"];m=e["mfe"];q=e["mae"]; newc=not CALIB.exists()
-   with CALIB.open("a",newline="") as f:
-    w=csv.writer(f)
-    if newc:w.writerow(["time","symbol","entry_price","score","score_regime","market_regime","regime_btc30","regime_btc60","regime_breadth_net","regime_rs60","flow_component","confirm_component","price_component","btc_component","breadth_component","rs60","ret30","ret60","ret180","ret300","ret900","mfe30","mae30","mfe60","mae60","mfe180","mae180","mfe300","mae300","mfe900","mae900"])
-    w.writerow([e["ts"],e["s"],e["p"],e["score"],e["regime"],e["market_regime"],e["regime_btc30"],e["regime_btc60"],e["regime_breadth"],e["regime_rs"],e["flow"],e["confirm"],e["pricepart"],e["btc"],e["breadth"],e["rs"],r["30"],r["60"],r["180"],r["300"],r["900"],m["30"],q["30"],m["60"],q["60"],m["180"],q["180"],m["300"],q["300"],m["900"],q["900"]])
-   news=not SCORES.exists()
-   with SCORES.open("a",newline="") as f:
-    w=csv.writer(f)
-    if news:w.writerow(["time","symbol","entry_price","score","regime","flow_component","confirm_component","price_component","btc_component","breadth_component","rs60","ret30","ret60","ret180","ret300","ret900"])
-    w.writerow([e["ts"],e["s"],e["p"],e["score"],e["regime"],e["flow"],e["confirm"],e["pricepart"],e["btc"],e["breadth"],e["rs"],r["30"],r["60"],r["180"],r["300"],r["900"]])
-   base=calibration_baseline(e["market_regime"],180)
-   bt=(f"baseline3m(n={base['n']} up={base['up']:.1f}% down={base['down']:.1f}% avg={base['avg']:+.3f}%)" if base else "baseline3m=WARMING")
-   MOMENTUM_VERBOSE and print(f'SCORE RESULT {e["s"]} score={e["score"]:+d} market={e["market_regime"]} 30s={r["30"]:+.3f}% 60s={r["60"]:+.3f}% 3m={r["180"]:+.3f}% 5m={r["300"]:+.3f}% 15m={r["900"]:+.3f}% | MFE3m={m["180"]:+.3f}% MAE3m={q["180"]:+.3f}% | {bt}')
-   score_pending.remove(e)
-
-def fast_setup(s):
- """Report-only entry candidate. Does not place trades or change raw EVENT logic."""
- n=time.time(); r=[x for x in flow_history[s] if n-x["ts"]<=15]
- if len(r)<3:return None
-
- pos=sum(x["d"]>0 for x in r); neg=sum(x["d"]<0 for x in r)
- side="BUY" if pos>neg else "SELL" if neg>pos else "NEUTRAL"
- if side=="NEUTRAL":return None
-
- persist=max(pos,neg)/len(r)
- cum=sum(x["d"] for x in r)
- tb=sum(x["gbuy"] for x in r); ts=sum(x["gsell"] for x in r); total=tb+ts
- wimb=cum/total*100 if total else 0
-
- vb=sum(x["vbuy"] for x in r); vs=sum(x["vsell"] for x in r); vt=vb+vs
- agreement=max(vb,vs)/vt if vt else 0
- vote="BUY" if vb>vs else "SELL" if vs>vb else "NEUTRAL"
-
- spot=sum(x["sd"] for x in r); fut=sum(x["fd"] for x in r)
- aligned=(side=="BUY" and spot>0 and fut>0) or (side=="SELL" and spot<0 and fut<0)
-
- # Fast signal: persistence + strong normalized flow + broad feed agreement + spot/futures alignment.
- ok=(persist>=.67 and abs(wimb)>=45 and agreement>=.75 and vote==side and aligned)
- if not ok:return None
-
- # Avoid printing the same setup every 5 seconds.
- key=(s,side)
- if n-setup_last.get(key,0)<15:return None
- setup_last[key]=n
-
- p=price(s)
- return (f"TRADE SETUP {s} {side} price={p} | window=15s "
-         f"| persistence={persist*100:.0f}% | cumDelta=${cum:,.0f} "
-         f"| weightedIMB={wimb:+.1f}% | agreement={agreement*100:.0f}% "
-         f"| spotFut=YES | REPORT-ONLY")
-
-# --- Telegram market regime reporter (report-only; does not alter Flow Radar calculations) ---
-TG_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-TG_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID","").strip()
-TG_HOURLY=int(os.getenv("TELEGRAM_HOURLY_SECONDS","3600"))
-TG_CHANGE_COOLDOWN=int(os.getenv("TELEGRAM_CHANGE_COOLDOWN","180"))
-TG_MIN_VALID=int(os.getenv("TELEGRAM_MIN_VALID","5"))
-reporter_state={"regime":None,"last_change":0.0,"last_hourly":0.0,"public":{},"public_ts":0.0}
-
-# --- RED STATE OUTPUT FOR LIVE BOT (does not alter indicator calculation) ---
-RED_STATE={"regime":"WARMING","ts":0.0}
-class _RedStateHandler(BaseHTTPRequestHandler):
- def do_GET(self):
-  if self.path not in ("/","/state"):
-   self.send_response(404); self.end_headers(); return
-  body=json.dumps(RED_STATE,separators=(",",":")).encode()
-  self.send_response(200); self.send_header("Content-Type","application/json")
-  self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
- def log_message(self,format,*args): return
-
-def start_red_state_server():
- port=int(os.getenv("PORT","8080"))
- HTTPServer(("0.0.0.0",port),_RedStateHandler).serve_forever()
-
-
-def telegram_send_sync(text):
- try:
-  if not TG_TOKEN or not TG_CHAT_ID:
-   print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID"); return False
-  data=urllib.parse.urlencode({"chat_id":TG_CHAT_ID,"text":text,"disable_web_page_preview":"true"}).encode()
-  req=urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",data=data,headers={"User-Agent":"FlowRadar-Telegram/1.0"})
-  with urllib.request.urlopen(req,timeout=10) as r:
-   ok=200<=getattr(r,"status",200)<300
-  print("TELEGRAM SENT" if ok else "TELEGRAM SEND FAILED"); return ok
- except Exception as e:
-  print("TELEGRAM SEND ERROR",repr(e)); return False
-
-async def telegram_send(text):
- return await asyncio.to_thread(telegram_send_sync,text)
-
-def public_market_sync():
- try:
-  # CoinGecko global endpoint: no key required. Public context is secondary and failure-safe.
-  x=http_json("https://api.coingecko.com/api/v3/global").get("data",{})
-  pct=x.get("market_cap_percentage",{}) or {}; ch=x.get("market_cap_change_percentage_24h_usd")
-  return {"btc_dom":float(pct.get("btc",0) or 0),"market24":float(ch or 0)}
- except Exception as e:
-  print("PUBLIC MARKET CONTEXT ERROR",repr(e)); return {}
-
-async def public_market():
- n=time.time()
- if n-reporter_state["public_ts"]>300:
-  reporter_state["public"]=await asyncio.to_thread(public_market_sync); reporter_state["public_ts"]=n
- return reporter_state["public"]
-
-def reporter_snapshot():
- b30=breadth_metrics(30); b60=breadth_metrics(60)
- btc30=window_metrics("BTCUSDT",30); btc60=window_metrics("BTCUSDT",60); bfs=flow_score("BTCUSDT")
- if not btc30 or not btc60:
-  return None
- valid=min(b30["valid"],b60["valid"]); meaningful=valid>=TG_MIN_VALID
- sell30=b30["net"]<=-.40 and b30["rs"]<0; sell60=b60["net"]<=-.40 and b60["rs"]<0
- buy30=b30["net"]>=.40 and b30["rs"]>0; buy60=b60["net"]>=.40 and b60["rs"]>0
- btc_weak=btc60["move"]<0 and (btc60["sign"]<0 or (bfs and bfs["score"]<=-35))
- btc_stable=btc60["move"]>=-.08 and not (bfs and bfs["score"]<=-65)
- if meaningful and sell30 and sell60 and (btc_weak or b60["rs"]<=-.15): regime="RED"
- elif (sell30 and sell60) or (b60["rs"]<-.10 and b60["net"]<0) or btc_weak: regime="ORANGE"
- elif meaningful and buy30 and buy60 and btc_stable and b60["positive"]>=.60: regime="GREEN"
- else: regime="YELLOW"
- return {"regime":regime,"b30":b30,"b60":b60,"btc30":btc30,"btc60":btc60,"btcfs":bfs,"valid":valid}
-
-def regime_message(snap,pub,reason):
- icons={"GREEN":"🟢","YELLOW":"🟡","ORANGE":"🟠","RED":"🔴"}; r=snap["regime"]; b30=snap["b30"]; b60=snap["b60"]; bf=snap["btcfs"]
- btcscore=(f"{bf['score']:+d}/100 {bf['regime']}" if bf else "warming")
- dom=(f"{pub.get('btc_dom',0):.2f}%" if pub.get('btc_dom') else "N/A"); m24=(f"{pub.get('market24',0):+.2f}%" if pub.get('market24') is not None and pub else "N/A")
- return (f"{icons[r]} FLOW RADAR — {r}\n"
-         f"Reason: {reason}\n"
-         f"BTC: ${price('BTCUSDT') or 0:,.2f} | 30s {snap['btc30']['move']:+.3f}% | 60s {snap['btc60']['move']:+.3f}%\n"
-         f"BTC Flow Score: {btcscore}\n"
-         f"ALT 30s: net={b30['net']:+.2f} | RS={b30['rs']:+.3f}% | valid={b30['valid']}/{len(ALT_CORE)}\n"
-         f"ALT 60s: net={b60['net']:+.2f} | RS={b60['rs']:+.3f}% | valid={b60['valid']}/{len(ALT_CORE)} | positive={b60['positive']*100:.0f}%\n"
-         f"BTC Dominance: {dom} | Total market 24h: {m24}\n"
-         f"REPORT-ONLY. Short-term flow can reverse; this is not a certain directional outcome.")
-
-async def telegram_reporter_tick():
- snap=reporter_snapshot()
- if not snap:return
- n=time.time()
- RED_STATE["regime"]=snap["regime"]; RED_STATE["ts"]=n
- old=reporter_state["regime"]; changed=old is not None and snap["regime"]!=old
- first=old is None; hourly=n-reporter_state["last_hourly"]>=TG_HOURLY
- if first or (changed and n-reporter_state["last_change"]>=TG_CHANGE_COOLDOWN) or hourly:
-  pub=await public_market()
-  reason="STARTUP" if first else (f"REGIME CHANGE {old} -> {snap['regime']}" if changed else "HOURLY SUMMARY")
-  if await telegram_send(regime_message(snap,pub,reason)):
-   if first or changed: reporter_state["regime"]=snap["regime"]; reporter_state["last_change"]=n
-   reporter_state["last_hourly"]=n
-
-
-async def report():
- spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
- while 1:
-  await asyncio.sleep(5)
-  if MOMENTUM_VERBOSE: print(f"\n=== MOMENTUM | FLOW RADAR V5.1 | {W}s | FLOW CONFIRM ===")
-  for sym in SYMBOLS:
-   votes=[]
-   if MOMENTUM_VERBOSE: print(f"\n{sym} price={price(sym)}")
-   for ex in spot+fut:
-    b,se,d,im,c=flow(sym,W,ex)
-    if MOMENTUM_VERBOSE: print(f" {ex:<17} B=${b:,.0f} S=${se:,.0f} D=${d:,.0f} IMB={im:+.1f}% n={c}")
-    if b+se>=1000:votes.append("BUY" if d>0 else "SELL")
-   sb,ss,sd,si,sc=group(sym,spot)
-   fb,ffs,fd,fi,fc=group(sym,fut)
-   ab,ase,ad,ai,ac=flow(sym)
-   remember_confirm(sym,price(sym),sd,fd,ad,ai,ab,ase,votes.count("BUY"),votes.count("SELL"))
-   fs=flow_score(sym)
-   if fs:
-    if MOMENTUM_VERBOSE:
-     print(f" FLOW SCORE        {fs['score']:+d}/100 | {fs['regime']} | flow={fs['flow']:+.1f} confirm={fs['confirm']:+.1f} price={fs['price']:+.1f} btc={fs['btc']:+.1f} breadth={fs['breadth']:+.1f} | RS60={fs['rs']:+.3f}% valid={fs['bvalid']} | 30s={fs['m30']} 60s={fs['m60']} | REPORT-ONLY")
-    record_score(sym,fs)
-   if MOMENTUM_VERBOSE:
-    setup=fast_setup(sym)
-    if setup: print(" "+setup)
-    detect(sym)
-  if MOMENTUM_VERBOSE:
-   print("\n "+alt_breadth(30))
-   print(" "+alt_breadth(60))
-  print_premove_top()
-  await telegram_reporter_tick()
-  outcomes()
-  score_outcomes()
-async def main():
- print("FLOW RADAR V5.2 STARTED | PREMOVE TOP-10 QUIET LOG | OKX SUPPORTED-MARKETS ONLY | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
- threading.Thread(target=start_red_state_server,daemon=True).start()
- await load_binance_universe()
- # Optional exchange metadata runs in background so PREMOVE starts immediately.
- if TG_TOKEN and TG_CHAT_ID:
-  ok=await telegram_send("FLOW RADAR TELEGRAM REPORTER ONLINE - waiting for 30s/60s warm-up.")
-  print("TELEGRAM STARTUP TEST OK" if ok else "TELEGRAM STARTUP TEST FAILED")
- else:
-  print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
- tasks=[report(),refresh_premove_market(),venue_metadata_background()]
- # Keep all four venue families. Unsupported contracts reconnect harmlessly; discovered
- # metadata/actual trades are reflected in VENUES x/4 instead of blocking the scanner.
- for s in SYMBOLS:
-  tasks += [binance(s,1),binance(s,0),bybit(s,1),bybit(s,0),okx(s,1),okx(s,0),gate(s,1),gate(s,0)]
- await asyncio.gather(*tasks)
-asyncio.run(main())
+import os,time,hmac,hashlib,json,logging
+from decimal import Decimal,ROUND_DOWN
+from urllib.parse import urlencode
+import requests
+import pandas as pd
+import numpy as np
+
+KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
+BASE=os.getenv("EXCHANGE_BASE_URL","https://fapi.binance.com").rstrip("/")
+TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
+BOT_VERSION="V2.1.2-BREAKEVEN-SLOTS-MAXQTY-FIX-LIVE-NO-BASKET-50REPORT"
+TF="15m"; NOTIONAL=100.0; TARGET_LEV=20; MAX_POS=30
+MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
+EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
+BASKET=50.0; LOSS_LIMIT=100.0
+ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
+TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
+S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
+# --- FLOW RADAR RED GUARD (only added behavior) ---
+FLOW_RADAR_STATE_URL=os.getenv("FLOW_RADAR_STATE_URL","").strip()
+FLOW_RADAR_MAX_AGE=float(os.getenv("FLOW_RADAR_MAX_AGE","15"))
+red_guard_active=False
+red_guard_latched=False
+logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False
+STATE="state.json"
+REPORT_STATE="hundred_trade_report.json"
+REPORT_EVERY_TRADES=100
+
+def pub(path,p=None):
+    r=S.get(BASE+path,params=p or {},timeout=15); r.raise_for_status(); return r.json()
+def signed(method,path,p=None):
+    q=dict(p or {}); q["timestamp"]=int(time.time()*1000); q["recvWindow"]=10000
+    qs=urlencode(q); sig=hmac.new(SECRET.encode(),qs.encode(),hashlib.sha256).hexdigest()
+    r=S.request(method,BASE+path+"?"+qs+"&signature="+sig,timeout=15)
+    if not r.ok: raise RuntimeError(f"{method} {path}: {r.text}")
+    return r.json()
+def balance():
+    try:
+        for x in signed("GET","/fapi/v2/balance"):
+            if x["asset"]=="USDT": return float(x["balance"])
+    except: pass
+    return 0
+def trade_rows(s,start_ms=0):
+    p={"symbol":s,"limit":1000}
+    if start_ms:p["startTime"]=int(start_ms)
+    return signed("GET","/fapi/v1/userTrades",p)
+
+def sync_realized():
+    """Book ACTUAL Binance realizedPnl and commissions for this bot's trades."""
+    global bot_realized,cycle_realized,loss_window
+    changed=False
+    for s,st in list(mine.items()):
+        try:
+            seen=set(str(x) for x in st.get("accounted_trade_ids",[]))
+            rows=trade_rows(s,st.get("entry_time",0))
+            for tr in rows:
+                tid=str(tr.get("id"))
+                if tid in seen:continue
+                # Binance userTrades: realizedPnl is exact realized profit/loss;
+                # commission is an actual cost and must be deducted.
+                delta=float(tr.get("realizedPnl",0))-float(tr.get("commission",0))
+                bot_realized+=delta
+                cycle_realized+=delta
+                loss_window+=delta
+                seen.add(tid); changed=True
+            st["accounted_trade_ids"]=list(seen)[-2000:]
+        except Exception as e:
+            logging.warning("%s PnL sync failed: %s",s,e)
+    if changed:save()
+
+def live_unrealized():
+    try:
+        ps=positions()
+        return sum(float(p.get("unRealizedProfit",0)) for s,p in ps.items() if s in mine)
+    except:
+        return 0.0
+
+def bot_balance():
+    # Virtual $500 allocation + ACTUAL realized bot PnL + current open PnL.
+    return ALLOCATED_CAPITAL + bot_realized + live_unrealized()
+
+def msg(t,bal=True):
+    if bal:t+=f"\nBot Balance: ${bot_balance():.2f}"
+    logging.info(t.replace("\n"," | "))
+    if TG and CHAT:
+        try: requests.post(f"https://api.telegram.org/bot{TG}/sendMessage",data={"chat_id":CHAT,"text":t},timeout=8)
+        except: pass
+def floor(x,step):
+    return float((Decimal(str(x))/Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)*Decimal(str(step)))
+def fmt(x): return f"{x:.12f}".rstrip("0").rstrip(".")
+def qty_ok(s,x):
+    # Respect Binance MARKET_LOT_SIZE maxQty as well as step/precision.
+    # This is intentionally only an execution-safety fix; signal/risk logic is unchanged.
+    max_q=float(meta[s].get("max",0) or 0)
+    if max_q>0:
+        x=min(float(x),max_q)
+    q=floor(x,meta[s]["step"])
+    prec=meta[s].get("qtyPrecision",8)
+    q=float(f"{q:.{prec}f}")
+    return q
+def save():
+    with open(STATE,"w") as f: json.dump({"mine":mine,"pause":pause_until,"loss":loss_window,"losing":losing_cycles,"cycle":cycle_realized,"bot_realized":bot_realized,"basket_lock_candle":basket_lock_candle,"btc_mode":btc_mode,"entry_candle":entry_candle,"entries_this_candle":entries_this_candle,"basket_rearm_dir":basket_rearm_dir,"basket_rearm_touched":basket_rearm_touched},f)
+def load():
+    global mine,pause_until,loss_window,losing_cycles,cycle_realized,bot_realized,basket_lock_candle,btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched
+    try:
+        d=json.load(open(STATE)); mine=d.get("mine",{}); pause_until=d.get("pause",0); loss_window=d.get("loss",0); losing_cycles=d.get("losing",0); cycle_realized=d.get("cycle",0); bot_realized=d.get("bot_realized",0); basket_lock_candle=d.get("basket_lock_candle",0); btc_mode=d.get("btc_mode","WAIT"); entry_candle=d.get("entry_candle",0); entries_this_candle=d.get("entries_this_candle",0); basket_rearm_dir=d.get("basket_rearm_dir",""); basket_rearm_touched=d.get("basket_rearm_touched",False)
+    except: pass
+
+def exchange_info():
+    global meta
+    for s in pub("/fapi/v1/exchangeInfo")["symbols"]:
+        if s.get("quoteAsset")!="USDT" or s.get("contractType")!="PERPETUAL" or s.get("status")!="TRADING": continue
+        fs={x["filterType"]:x for x in s["filters"]}; lot=fs.get("MARKET_LOT_SIZE",fs.get("LOT_SIZE",{})); pf=fs.get("PRICE_FILTER",{})
+        meta[s["symbol"]]={"step":float(lot.get("stepSize",".001")),"min":float(lot.get("minQty","0")),"max":float(lot.get("maxQty","0") or 0),"tick":float(pf.get("tickSize",".0001")),"qtyPrecision":int(s.get("quantityPrecision",8))}
+def positions():
+    return {p["symbol"]:p for p in signed("GET","/fapi/v2/positionRisk") if abs(float(p["positionAmt"]))>0}
+def pos(s):
+    for p in signed("GET","/fapi/v2/positionRisk",{"symbol":s}):
+        if abs(float(p["positionAmt"]))>0:return p
+def market(s,side,qty,reduce=False):
+    qty=qty_ok(s,qty)
+    if qty<=0: raise RuntimeError(f"{s}: quantity rounded to zero")
+    p={"symbol":s,"side":side,"type":"MARKET","quantity":fmt(qty),"newOrderRespType":"RESULT"}
+    if reduce:p["reduceOnly"]="true"
+    return signed("POST","/fapi/v1/order",p)
+def cancel_algo(s):
+    try:signed("DELETE","/fapi/v1/algoOpenOrders",{"symbol":s})
+    except:pass
+def algo_close(s,direction,order_type,px,qty=None,close_position=False):
+    side="SELL" if direction=="LONG" else "BUY"; px=floor(px,meta[s]["tick"])
+    q={"algoType":"CONDITIONAL","symbol":s,"side":side,"type":order_type,
+       "triggerPrice":fmt(px),"workingType":"MARK_PRICE","reduceOnly":"true"}
+    if close_position:
+        q.pop("reduceOnly",None); q["closePosition"]="true"
+    elif qty is not None:
+        qty=qty_ok(s,qty)
+        if qty<=0: raise RuntimeError(f"{s}: algo quantity rounded to zero")
+        q["quantity"]=fmt(qty)
+    return signed("POST","/fapi/v1/algoOrder",q)
+
+def stop(s,direction,px):
+    return algo_close(s,direction,"STOP_MARKET",px,close_position=True)
+
+def place_targets(s,direction,entry_px,lev,full_qty):
+    q1=qty_ok(s,full_qty*0.50)
+    q2=qty_ok(s,full_qty*0.25)
+    q3=qty_ok(s,max(0.0,full_qty-q1-q2))
+    tp1_move=1.00/lev
+    tp2_move=1.50/lev
+    tp3_move=2.00/lev
+    tp1=entry_px*(1+tp1_move) if direction=="LONG" else entry_px*(1-tp1_move)
+    tp2=entry_px*(1+tp2_move) if direction=="LONG" else entry_px*(1-tp2_move)
+    tp3=entry_px*(1+tp3_move) if direction=="LONG" else entry_px*(1-tp3_move)
+    if q1>0: algo_close(s,direction,"TAKE_PROFIT_MARKET",tp1,qty=q1)
+    if q2>0: algo_close(s,direction,"TAKE_PROFIT_MARKET",tp2,qty=q2)
+    if q3>0: algo_close(s,direction,"TAKE_PROFIT_MARKET",tp3,qty=q3)
+    return tp1,tp2,tp3
+def leverage(s):
+    for l in range(TARGET_LEV,0,-1):
+        try:
+            return int(signed("POST","/fapi/v1/leverage",{"symbol":s,"leverage":l})["leverage"])
+        except Exception:
+            continue
+    raise RuntimeError("No leverage available")
+def klines(s):
+    k=pub("/fapi/v1/klines",{"symbol":s,"interval":TF,"limit":110})
+    if k and int(k[-1][6])>=int(time.time()*1000):k=k[:-1]
+    return k
+def sma(values, period):
+    if not values or len(values) < period:
+        return 0.0
+    return sum(values[-period:]) / period
+
+def sig(s):
+    """BTC 15m master direction from the last CLOSED candle."""
+    k=klines(s)
+    if not k or len(k)<99:return "WAIT"
+    closes=[float(x[4]) for x in k]
+    last=closes[-1]
+    m25=sum(closes[-25:])/25
+    m99=sum(closes[-99:])/99
+    if last>m99 and last>m25:return "LONG"
+    if last<m99 and last<m25:return "SHORT"
+    return "WAIT"
+
+def btc_ma_snapshot():
+    """Last CLOSED BTC 15m candle + SMA25/SMA99."""
+    k=klines("BTCUSDT")
+    if not k or len(k)<99:return None
+    closes=[float(x[4]) for x in k]
+    row=k[-1]
+    return {
+        "candle":int(row[0]),
+        "high":float(row[2]),
+        "low":float(row[3]),
+        "close":float(row[4]),
+        "ma25":sum(closes[-25:])/25,
+        "ma99":sum(closes[-99:])/99,
+    }
+
+def universe():
+    a=[]
+    for t in pub("/fapi/v1/ticker/24hr"):
+        s=t["symbol"]
+        if s in meta and s!="BTCUSDT" and s not in EXCLUDED and float(t.get("quoteVolume",0))>=MIN_VOL:a.append((s,float(t["quoteVolume"])))
+    return [s for s,_ in sorted(a,key=lambda x:x[1],reverse=True)]
+def closed_candle_id(s="BTCUSDT"):
+    k=klines(s)
+    return int(k[-1][0]) if k else 0
+
+def estimated_exit_fees(ps):
+    # Conservative market/taker estimate for closing every remaining bot position.
+    fees=0.0
+    for s,p in ps.items():
+        if s not in mine: continue
+        qty=abs(float(p["positionAmt"]))
+        mark=float(p.get("markPrice") or p["entryPrice"])
+        fees += qty*mark*TAKER_FEE_RATE
+    return fees
+
+def roi(p):
+    amt=abs(float(p["positionAmt"])); ep=float(p["entryPrice"]); lev=float(p.get("leverage",20)); pnl=float(p["unRealizedProfit"])
+    margin=amt*ep/max(lev,1); return 100*pnl/margin if margin else 0
+def close(s,p,pct,reason):
+    global loss_window,cycle_realized,bot_realized
+    amt=abs(float(p["positionAmt"])); qty=qty_ok(s,amt*pct/100)
+    if qty<=0:return
+    market(s,"SELL" if float(p["positionAmt"])>0 else "BUY",qty,True)
+    time.sleep(.35)
+    sync_realized()
+    msg(f"{s} {reason}\nPnL booked from Binance trade history")
+def enter(s,d,setup=None,btc=None):
+    if s in mine:return
+    ps=positions()
+    # A bot-owned position at breakeven or better (lock_stage >= 2) no longer
+    # consumes one of the 20 RISK slots. It stays open and managed normally.
+    if risk_position_count(ps)>=MAX_POS or s in ps:return
+    px=float(pub("/fapi/v1/ticker/price",{"symbol":s})["price"]); lev=leverage(s)
+    qty=qty_ok(s,(7.5*lev)/px)
+    if qty<meta[s]["min"] or qty<=0:return
+    market(s,"BUY" if d=="LONG" else "SELL",qty); time.sleep(.25); p=pos(s)
+    if not p:return
+    ep=float(p["entryPrice"]); adverse=.50/lev
+    sp=ep*(1-adverse) if d=="LONG" else ep*(1+adverse)
+    cancel_algo(s)
+    stop(s,d,sp)
+
+    favorable=.50/lev
+    tp=ep*(1+favorable) if d=="LONG" else ep*(1-favorable)
+    algo_close(s,d,"TAKE_PROFIT_MARKET",tp,close_position=True)
+    # V2.1: keep ONE exchange-side protective STOP only. Profit targets are managed
+    # by manage() from live leveraged ROI. This prevents -4045 max algo/stop-order saturation.
+    details = (setup or {}).get("details","")
+    entry_rsi = None
+    entry_vol = None
+    entry_buy = None
+
+    try:
+        for part in details.split():
+            if part.startswith("rsi="):
+                entry_rsi = float(part.split("=")[1])
+            elif part.startswith("vol="):
+                entry_vol = float(part.split("=")[1])
+            elif part.startswith("buy="):
+                entry_buy = float(part.split("=")[1])
+    except:
+        pass
+
+    mine[s]={
+        "dir":d,
+        "tp1":False,
+        "tp2":False,
+        "lock_stage":0,
+        "initial_qty":abs(float(p["positionAmt"])),
+        "entry_time":int(time.time()*1000)-10000,
+        "accounted_trade_ids":[],
+        "entry_rsi":entry_rsi,
+        "entry_vol":entry_vol,
+        "entry_buy":entry_buy,
+        "entry_score":float((setup or {}).get("score",0)),
+        "btc_context":(btc or {}).get("bias","UNKNOWN"),
+        "btc_score":float((btc or {}).get("score",0))
+    }
+    save()
+    sync_realized()
+    msg(f"OPEN {d} {s}\nNotional: $100 | Leverage: {lev}x\nEntry: {ep}\nProfit Lock: +30->SL -25 | +50->BE | +75->SL +25 | TP1 +100% (50%, SL +50) | TP2 +150% (25%, SL +100) | TP3 +200% final")
+def close_all(reason):
+    global cycle_realized,losing_cycles,pause_until,basket_lock_candle,basket_rearm_dir,basket_rearm_touched
+    ps=positions(); targets=[(s,p) for s,p in ps.items() if s in mine]
+    cycle_total=cycle_realized+sum(float(p["unRealizedProfit"]) for _,p in targets)
+
+    # Cancel protection first, then retry market close up to 3 times.
+    for s,_ in targets:
+        cancel_algo(s)
+
+    failed=[]
+    for s,_ in targets:
+        ok=False
+        for attempt in range(1,4):
+            try:
+                live=pos(s)
+                if not live:
+                    ok=True; break
+                close(s,live,100,reason)
+                time.sleep(.35)
+                if not pos(s):
+                    ok=True; break
+            except Exception as e:
+                logging.error("%s close attempt %d/3: %s",s,attempt,e)
+                time.sleep(1.0)
+        if not ok:
+            failed.append(s)
+
+    # Re-check exchange state. Never pretend basket is finished while a bot position remains.
+    live_ps=positions()
+    still_open=[s for s in mine if s in live_ps]
+    if still_open:
+        msg("BASKET CLOSE INCOMPLETE | still open: "+", ".join(still_open))
+        # Restore a protective SL for any remaining position where possible.
+        for s in still_open:
+            try:
+                lp=live_ps[s]
+                d="LONG" if float(lp["positionAmt"])>0 else "SHORT"
+                ep=float(lp["entryPrice"]); lev=float(lp.get("leverage",20))
+                adverse=.50/max(lev,1)
+                sp=ep*(1-adverse) if d=="LONG" else ep*(1+adverse)
+                stop(s,d,sp)
+            except Exception as e:
+                logging.error("%s restore stop: %s",s,e)
+        save()
+        return False
+
+    if cycle_total<0: losing_cycles+=1
+    else: losing_cycles=0
+    if losing_cycles>=3:
+        pause_until=max(pause_until,time.time()+3600); losing_cycles=0; msg("3 losing cycles -> PAUSE 1 HOUR")
+
+    mine.clear(); cycle_realized=0
+    basket_lock_candle=closed_candle_id("BTCUSDT")
+
+    # V2: BTC is context only, never a hard direction gate.
+    # Keep the existing one-closed-candle basket lock; disable MA25 directional re-arm.
+    if reason=="BASKET NET +$50":
+        basket_rearm_dir=""
+        basket_rearm_touched=False
+        msg("BASKET +$50 CLOSED | next cycle waits for the next closed BTC 15m candle")
+    save()
+    return True
+
+def protected_stop_for_roi(s,p,d,target_roi):
+    """Replace the single exchange-side STOP so a retrace locks target leveraged ROI."""
+    ep=float(p["entryPrice"]); lev=float(p.get("leverage",20))
+    move=(float(target_roi)/100.0)/max(lev,1.0)
+    sp=ep*(1+move) if d=="LONG" else ep*(1-move)
+    cancel_algo(s)
+    stop(s,d,sp)
+    return sp
+
+
+def _report_load():
+    try:
+        return json.load(open(REPORT_STATE))
+    except:
+        return {"closed":[]}
+
+def _report_save(d):
+    try:
+        with open(REPORT_STATE,"w") as f: json.dump(d,f)
+    except Exception as e:
+        logging.warning("50-trade report save failed: %s",e)
+
+def record_closed_trade(s, st):
+    """Diagnostics only. Does not affect signals, entries, exits, SL or TP."""
+    try:
+        rows=trade_rows(s,st.get("entry_time",0))
+        if not rows:return
+        realized=sum(float(x.get("realizedPnl",0)) for x in rows)
+        commission=sum(float(x.get("commission",0)) for x in rows)
+        exits=[x for x in rows if abs(float(x.get("realizedPnl",0)))>0]
+        exit_px=float(exits[-1].get("price",0)) if exits else 0.0
+        last_time=max([int(x.get("time",0)) for x in rows] or [int(time.time()*1000)])
+        duration=max(0,(last_time-int(st.get("entry_time",last_time)))/1000)
+        net=realized-commission
+        stage=int(st.get("lock_stage",0))
+        reason="EXCHANGE_CLOSE"
+        if stage>=6: reason="TP3_FINAL"
+        elif stage>=5: reason="AFTER_TP2_OR_PROTECTED_STOP"
+        elif stage>=4: reason="AFTER_TP1_OR_PROTECTED_STOP"
+        elif stage>=3: reason="PROFIT_LOCK_+25_STOP_OR_EXTERNAL"
+        elif stage>=2: reason="BREAKEVEN_STOP_OR_EXTERNAL"
+        elif stage>=1: reason="PROTECTED_-25_STOP_OR_EXTERNAL"
+        elif net<0: reason="INITIAL_SL_OR_EXTERNAL"
+        d=_report_load()
+        d["closed"].append({
+            "symbol":s,
+            "side":st.get("dir",""),
+            "net":net,
+            "realized":realized,
+            "commission":commission,
+            "exit_price":exit_px,
+            "duration_sec":duration,
+            "reason":reason,
+            "lock_stage":stage,
+            "time":last_time,
+            "entry_rsi":st.get("entry_rsi"),
+            "entry_vol":st.get("entry_vol"),
+            "entry_buy":st.get("entry_buy"),
+            "entry_score":st.get("entry_score"),
+            "btc_context":st.get("btc_context","UNKNOWN"),
+            "btc_score":st.get("btc_score")
+        })
+        _report_save(d)
+        logging.info("%s EXIT DIAG | reason=%s | exit=%s | realized=%.4f | fees=%.4f | net=%.4f | duration=%.0fs",
+                     s,reason,exit_px,realized,commission,net,duration)
+    except Exception as e:
+        logging.warning("%s exit diagnostic failed: %s",s,e)
+
+def maybe_hundred_trade_report():
+    """Full diagnostic report every 100 closed trades; reporting only."""
+    d=_report_load()
+    rows=d.get("closed",[])
+    if len(rows)<REPORT_EVERY_TRADES:return
+
+    batch=rows[:REPORT_EVERY_TRADES]
+
+    wins=[x for x in batch if x.get("net",0)>0]
+    losses=[x for x in batch if x.get("net",0)<0]
+    breakeven=[x for x in batch if x.get("net",0)==0]
+
+    net=sum(x.get("net",0) for x in batch)
+    fees=sum(x.get("commission",0) for x in batch)
+
+    gross_profit=sum(x.get("net",0) for x in wins)
+    gross_loss=abs(sum(x.get("net",0) for x in losses))
+
+    win_rate=100*len(wins)/len(batch) if batch else 0
+    avg_win=gross_profit/len(wins) if wins else 0
+    avg_loss=gross_loss/len(losses) if losses else 0
+    profit_factor=gross_profit/gross_loss if gross_loss else 0
+
+    best=max(batch,key=lambda x:x.get("net",0))
+    worst=min(batch,key=lambda x:x.get("net",0))
+
+    longs=[x for x in batch if x.get("side")=="LONG"]
+    shorts=[x for x in batch if x.get("side")=="SHORT"]
+
+    long_wins=[x for x in longs if x.get("net",0)>0]
+    short_wins=[x for x in shorts if x.get("net",0)>0]
+
+    long_net=sum(x.get("net",0) for x in longs)
+    short_net=sum(x.get("net",0) for x in shorts)
+
+    long_wr=100*len(long_wins)/len(longs) if longs else 0
+    short_wr=100*len(short_wins)/len(shorts) if shorts else 0
+
+    avg_duration=sum(x.get("duration_sec",0) for x in batch)/len(batch) if batch else 0
+
+    from collections import Counter
+
+    loss_reasons=Counter(x.get("reason","UNKNOWN") for x in losses)
+    loss_symbols=Counter(x.get("symbol","UNKNOWN") for x in losses)
+
+    reason_text=", ".join(
+        f"{k}: {v}" for k,v in loss_reasons.most_common()
+    ) or "None"
+
+    loss_symbol_text=", ".join(
+        f"{k}: {v}" for k,v in loss_symbols.most_common(10)
+    ) or "None"
+
+    # ---- ENTRY DIAGNOSTICS ----
+    def avg_field(data,key):
+        vals=[]
+        for x in data:
+            v=x.get(key)
+            if v is not None:
+                try:
+                    vals.append(float(v))
+                except:
+                    pass
+        return sum(vals)/len(vals) if vals else None
+
+    def fmt_avg(v):
+        return "N/A" if v is None else f"{v:.2f}"
+
+    win_rsi=avg_field(wins,"entry_rsi")
+    loss_rsi=avg_field(losses,"entry_rsi")
+
+    win_vol=avg_field(wins,"entry_vol")
+    loss_vol=avg_field(losses,"entry_vol")
+
+    win_buy=avg_field(wins,"entry_buy")
+    loss_buy=avg_field(losses,"entry_buy")
+
+    win_score=avg_field(wins,"entry_score")
+    loss_score=avg_field(losses,"entry_score")
+
+    win_btc_score=avg_field(wins,"btc_score")
+    loss_btc_score=avg_field(losses,"btc_score")
+
+    btc_contexts={}
+    for context in ("LONG","SHORT","NEUTRAL","UNKNOWN"):
+        context_rows=[x for x in batch if x.get("btc_context","UNKNOWN")==context]
+        if not context_rows:
+            continue
+
+        context_wins=[x for x in context_rows if x.get("net",0)>0]
+        context_losses=[x for x in context_rows if x.get("net",0)<0]
+        context_net=sum(x.get("net",0) for x in context_rows)
+        context_wr=100*len(context_wins)/len(context_rows)
+
+        btc_contexts[context]={
+            "trades":len(context_rows),
+            "wins":len(context_wins),
+            "losses":len(context_losses),
+            "wr":context_wr,
+            "net":context_net
+        }
+
+    btc_text="\n".join(
+        f"{k}: Trades {v['trades']} | W {v['wins']} | L {v['losses']} | "
+        f"WR {v['wr']:.1f}% | Net ${v['net']:.2f}"
+        for k,v in btc_contexts.items()
+    ) or "No BTC context data"
+
+    report1=(
+        f"100-TRADE FULL DIAGNOSTIC REPORT\n\n"
+
+        f"TRADES\n"
+        f"Closed: {len(batch)}\n"
+        f"Wins: {len(wins)} | Losses: {len(losses)} | BE: {len(breakeven)}\n"
+        f"Win Rate: {win_rate:.1f}%\n\n"
+
+        f"PNL\n"
+        f"Net PnL: ${net:.2f}\n"
+        f"Gross Profit: ${gross_profit:.2f}\n"
+        f"Gross Loss: -${gross_loss:.2f}\n"
+        f"Fees: ${fees:.2f}\n"
+        f"Profit Factor: {profit_factor:.2f}\n"
+        f"Average Win: ${avg_win:.2f}\n"
+        f"Average Loss: -${avg_loss:.2f}\n\n"
+
+        f"BEST / WORST\n"
+        f"Best: {best.get('symbol')} {best.get('side')} ${best.get('net',0):.2f}\n"
+        f"Worst: {worst.get('symbol')} {worst.get('side')} ${worst.get('net',0):.2f}\n\n"
+
+        f"LONG PERFORMANCE\n"
+        f"Trades: {len(longs)} | Wins: {len(long_wins)}\n"
+        f"Win Rate: {long_wr:.1f}% | Net: ${long_net:.2f}\n\n"
+
+        f"SHORT PERFORMANCE\n"
+        f"Trades: {len(shorts)} | Wins: {len(short_wins)}\n"
+        f"Win Rate: {short_wr:.1f}% | Net: ${short_net:.2f}\n\n"
+
+        f"TIMING\n"
+        f"Average duration: {avg_duration/60:.1f} minutes\n\n"
+
+        f"LOSS DIAGNOSTICS\n"
+        f"Loss/Exit causes: {reason_text}\n"
+        f"Most repeated losing symbols: {loss_symbol_text}"
+    )
+
+    report2=(
+        f"100-TRADE ENTRY ANALYSIS\n\n"
+
+        f"WINNERS vs LOSERS\n"
+        f"RSI: {fmt_avg(win_rsi)} vs {fmt_avg(loss_rsi)}\n"
+        f"Volume Ratio: {fmt_avg(win_vol)} vs {fmt_avg(loss_vol)}\n"
+        f"Buy Ratio: {fmt_avg(win_buy)} vs {fmt_avg(loss_buy)}\n"
+        f"Entry Score: {fmt_avg(win_score)} vs {fmt_avg(loss_score)}\n"
+        f"BTC Score: {fmt_avg(win_btc_score)} vs {fmt_avg(loss_btc_score)}\n\n"
+
+        f"BTC CONTEXT PERFORMANCE\n"
+        f"{btc_text}\n\n"
+
+        f"NOTE: diagnostic comparison only; "
+        f"strategy, entries, exits, SL and TP are unchanged."
+    )
+
+    msg(report1,bal=False)
+    msg(report2,bal=False)
+
+    _report_save({"closed":rows[REPORT_EVERY_TRADES:]})
+
+def manage():
+    global pause_until,loss_window
+    sync_realized()
+    ps=positions()
+    for s in list(mine):
+        if s not in ps:
+            st=dict(mine.get(s,{}))
+            sync_realized()
+            record_closed_trade(s,st)
+            mine.pop(s,None); save()
+            msg(f"{s} CLOSED ON EXCHANGE | Actual PnL reconciled")
+            maybe_hundred_trade_report()
+    for s in list(mine):
+        p=ps.get(s)
+        if not p: continue
+        d="LONG" if float(p["positionAmt"])>0 else "SHORT"
+        r=roi(p)
+        st=int(mine[s].get("lock_stage",0))
+        initial_qty=float(mine[s].get("initial_qty",abs(float(p["positionAmt"]))))
+
+        try:
+            if r>=50:
+                cancel_algo(s)
+                close(s,p,100,"TP +50% ROI FINAL")
+                continue
+        except Exception as e:
+            logging.warning("%s profit-lock management failed: %s",s,e)
+            # Best effort: if stop replacement/partial close failed, do not advance stage.
+
+    if loss_window<=-LOSS_LIMIT and time.time()>=pause_until:
+        pause_until=time.time()+10800; loss_window=0; save(); msg("Loss window reached -$100 -> PAUSE 3 HOURS")
+
+
+
+# --- Exact Liquidity Reversal Staged signal reused from prior bot ---
+def liq_ema(s, n): return s.ewm(span=n, adjust=False).mean()
+
+def liq_sma(s, n): return s.rolling(n).mean()
+
+def liq_atr(df, n=14):
+    pc = df.close.shift(1)
+    tr = pd.concat([(df.high-df.low), (df.high-pc).abs(), (df.low-pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean()
+
+def liq_rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+def liq_liquidity_signal(df):
+    basis = liq_ema(df.close, 55)
+    a55 = liq_atr(df, 55)
+    upper, lower = basis+4*a55, basis-4*a55
+    a14 = liq_atr(df, 14)
+    recent = slice(-11, -1)
+    lower_trap = bool((df.close.iloc[recent] < lower.iloc[recent]).any() and df.close.iat[-1] > lower.iat[-1])
+    upper_trap = bool((df.close.iloc[recent] > upper.iloc[recent]).any() and df.close.iat[-1] < upper.iat[-1])
+    # PO3: a compressed 20-bar range followed by a wick sweep and close-back.
+    rh, rl = df.high.iloc[-22:-2].max(), df.low.iloc[-22:-2].min()
+    width = rh-rl
+    compressed = width/max(float(a55.iat[-2]), 1e-12) <= 8.0
+    bull_po3 = compressed and df.low.iat[-1] < rl and df.close.iat[-1] > rl
+    bear_po3 = compressed and df.high.iat[-1] > rh and df.close.iat[-1] < rh
+    rv = liq_rsi(df.close, 20).iat[-1]
+    if (lower_trap or bull_po3) and rv < 55:
+        stop = min(df.low.iloc[-2:].min(), rl)-0.5*a14.iat[-1]
+        target = max(basis.iat[-1], rh)
+        return {"side":"LONG", "stop":float(stop), "target":float(target), "tag":"TRAP/PO3+RSI"}
+    if (upper_trap or bear_po3) and rv > 45:
+        stop = max(df.high.iloc[-2:].max(), rh)+0.5*a14.iat[-1]
+        target = min(basis.iat[-1], rl)
+        return {"side":"SHORT", "stop":float(stop), "target":float(target), "tag":"TRAP/PO3+RSI"}
+    return None
+
+def liq_df(s):
+    k=klines(s)
+    if not k or len(k)<100:return None
+    # klines() already excludes the forming candle in this bot.
+    return pd.DataFrame({
+        "open":[float(x[1]) for x in k],
+        "high":[float(x[2]) for x in k],
+        "low":[float(x[3]) for x in k],
+        "close":[float(x[4]) for x in k],
+        "volume":[float(x[5]) for x in k],
+    })
+
+def liquidity_entry_signal(s):
+    df=liq_df(s)
+    if df is None:return None
+    try:
+        return liq_liquidity_signal(df)
+    except Exception as e:
+        logging.warning("%s liquidity signal: %s",s,e)
+        return None
+
+def open_position_count():
+    try:
+        return sum(1 for p in signed("GET","/fapi/v2/positionRisk") if abs(float(p.get("positionAmt",0)))>0)
+    except Exception as e:
+        logging.warning("open position count failed: %s",e)
+        return len(mine)
+
+def risk_position_count(ps=None):
+    """Count only positions that still consume a risk slot.
+
+    Bot-owned positions whose stop has reached breakeven or better
+    (lock_stage >= 2) are excluded. Unknown/account positions remain counted
+    conservatively so this change cannot silently ignore another position.
+    """
+    try:
+        ps = ps if ps is not None else positions()
+        n=0
+        for s in ps:
+            st=mine.get(s)
+            if st is None or int(st.get("lock_stage",0)) < 2:
+                n += 1
+        return n
+    except Exception as e:
+        logging.warning("risk position count failed: %s",e)
+        return sum(1 for s,st in mine.items() if int(st.get("lock_stage",0)) < 2)
+
+def rsi_last(vals, period=14):
+    x=pd.Series(vals,dtype=float); d=x.diff()
+    up=d.clip(lower=0).ewm(alpha=1/period,adjust=False).mean()
+    dn=(-d.clip(upper=0)).ewm(alpha=1/period,adjust=False).mean()
+    rs=up/dn.replace(0,np.nan); z=100-(100/(1+rs))
+    return float(z.iloc[-1]) if len(z) and pd.notna(z.iloc[-1]) else 50.0
+
+def btc_context():
+    """BTC flow is a SMALL scoring input only. It cannot block either side."""
+    k=klines("BTCUSDT")
+    if not k or len(k)<100:return {"bias":"NEUTRAL","long_bonus":0.0,"short_bonus":0.0,"score":0.0}
+    c=np.array([float(x[4]) for x in k]); h=np.array([float(x[2]) for x in k])
+    l=np.array([float(x[3]) for x in k]); v=np.array([float(x[5]) for x in k])
+    tb=np.array([float(x[9]) for x in k])
+    e25=float(pd.Series(c).ewm(span=25,adjust=False).mean().iloc[-1])
+    e99=float(pd.Series(c).ewm(span=99,adjust=False).mean().iloc[-1])
+    tp=(h+l+c)/3; vv=v[-20:]
+    vwap=float(np.sum(tp[-20:]*vv)/max(np.sum(vv),1e-12))
+    buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    score=(2.5 if c[-1]>vwap else -2.5)+(2 if e25>e99 else -2)
+    score+=max(-3,min(3,(buy-.5)*20))
+    if vr>1.2:score+=1.5 if c[-1]>c[-2] else -1.5
+    bias="LONG" if score>=2.5 else "SHORT" if score<=-2.5 else "NEUTRAL"
+    bonus=max(-8,min(8,score))
+    return {"bias":bias,"long_bonus":bonus,"short_bonus":-bonus,"score":score,
+            "buy_ratio":buy,"vol_ratio":vr,"close":float(c[-1]),"vwap":vwap}
+
+def long_engine(s,btc):
+    """Dedicated LONG: trend/reclaim + CHOCH/retest + volume/aggression."""
+    k=klines(s)
+    if not k or len(k)<100:return None
+    o=np.array([float(x[1]) for x in k]); h=np.array([float(x[2]) for x in k])
+    l=np.array([float(x[3]) for x in k]); c=np.array([float(x[4]) for x in k])
+    v=np.array([float(x[5]) for x in k]); tb=np.array([float(x[9]) for x in k])
+    e21=float(pd.Series(c).ewm(span=21,adjust=False).mean().iloc[-1])
+    e55=float(pd.Series(c).ewm(span=55,adjust=False).mean().iloc[-1])
+    tp=(h+l+c)/3; vwap=float(np.sum(tp[-20:]*v[-20:])/max(np.sum(v[-20:]),1e-12))
+    r=rsi_last(c); vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    if r > 70:
+        return None
+    buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    prior_high=float(np.max(h[-12:-2]))
+    choch=c[-1]>prior_high or (c[-1]>e21 and c[-2]<=e21)
+    retest=l[-1]<=max(e21,vwap)*1.003 and c[-1]>max(e21,vwap)
+    trend=e21>e55 and c[-1]>e21
+    reclaim=c[-1]>vwap and c[-2]<=vwap
+    impulse=c[-1]>o[-1] and vr>=1.05
+    score=0.0
+    if trend:score+=24
+    if c[-1]>vwap:score+=14
+    if choch:score+=18
+    if retest or reclaim:score+=14
+    if 48<=r<=72:score+=10
+    if buy>=.52:score+=10
+    if impulse:score+=10
+    score+=float(btc.get("long_bonus",0))
+    if not (score>=70 and (choch or retest or reclaim) and (trend or c[-1]>vwap)):return None
+    return {"side":"LONG","score":round(score,2),"tag":"LONG_TREND+VWAP+CHOCH+FLOW",
+            "details":f"rsi={r:.1f} vol={vr:.2f} buy={buy:.2f}"}
+
+def short_engine(s,btc):
+    """Preserve original Liquidity Reversal SHORT trigger; add quality ranking."""
+    ls=liquidity_entry_signal(s)
+    if not ls or ls.get("side")!="SHORT":return None
+    k=klines(s)
+    if not k or len(k)<100:return None
+    o=np.array([float(x[1]) for x in k]); h=np.array([float(x[2]) for x in k])
+    l=np.array([float(x[3]) for x in k]); c=np.array([float(x[4]) for x in k])
+    v=np.array([float(x[5]) for x in k]); tb=np.array([float(x[9]) for x in k])
+    e21=float(pd.Series(c).ewm(span=21,adjust=False).mean().iloc[-1])
+    r=rsi_last(c); vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
+    buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    breakdown=c[-1]<e21 or c[-1]<l[-2]
+    rejection=h[-1]>h[-2] and c[-1]<o[-1]
+    score=62.0
+    if breakdown:score+=12
+    if rejection:score+=8
+    if r<58:score+=6
+    if buy<=.48:score+=8
+    if vr>=1.05 and c[-1]<o[-1]:score+=6
+    score+=float(btc.get("short_bonus",0))
+    if score<70:return None
+    return {"side":"SHORT","score":round(score,2),"tag":"SHORT_LIQUIDITY_REVERSAL+QUALITY",
+            "details":f"rsi={r:.1f} vol={vr:.2f} buy={buy:.2f}"}
+
+def flow_radar_red():
+    """Consume Flow Radar's own RED result; never re-derive a different indicator here."""
+    if not FLOW_RADAR_STATE_URL:
+        return False
+    try:
+        r=requests.get(FLOW_RADAR_STATE_URL,timeout=5)
+        r.raise_for_status()
+        d=r.json()
+        ts=float(d.get("ts",0) or 0)
+        if not ts or time.time()-ts>FLOW_RADAR_MAX_AGE:
+            logging.warning("FLOW RADAR RED GUARD stale state; ignoring")
+            return False
+        return str(d.get("regime","")).upper()=="RED"
+    except Exception as e:
+        logging.warning("FLOW RADAR RED GUARD unavailable: %s",e)
+        return False
+
+def close_every_open_position(reason):
+    """Emergency account-flat action for RED: close ALL futures positions, including unknown ones."""
+    ps=positions()
+    for s in list(ps):
+        cancel_algo(s)
+    failed=[]
+    for s in list(ps):
+        ok=False
+        for attempt in range(1,4):
+            try:
+                p=pos(s)
+                if not p:
+                    ok=True; break
+                amt=abs(float(p["positionAmt"]))
+                market(s,"SELL" if float(p["positionAmt"])>0 else "BUY",amt,True)
+                time.sleep(.35)
+                if not pos(s):
+                    ok=True; break
+            except Exception as e:
+                logging.error("%s RED emergency close attempt %d/3: %s",s,attempt,e)
+                time.sleep(1)
+        if not ok: failed.append(s)
+    left=positions()
+    if left:
+        msg("FLOW RADAR RED | EMERGENCY CLOSE INCOMPLETE | still open: "+", ".join(left),bal=False)
+        return False
+    # Reconcile bot-owned state only after the exchange confirms the account is flat.
+    for s,st in list(mine.items()):
+        try:
+            sync_realized()
+            record_closed_trade(s,dict(st))
+        except Exception as e:
+            logging.warning("%s RED close diagnostic failed: %s",s,e)
+    mine.clear()
+    save()
+    msg("🔴 FLOW RADAR RED | ALL FUTURES POSITIONS CLOSED | OPEN POSITIONS = 0 | NEW ENTRIES BLOCKED",bal=False)
+    return True
+
+def red_guard_tick():
+    global red_guard_active,red_guard_latched
+    red=flow_radar_red()
+    red_guard_active=red
+    if red:
+        if not red_guard_latched or positions():
+            if close_every_open_position("FLOW RADAR RED"):
+                red_guard_latched=True
+        return True
+    if red_guard_latched:
+        red_guard_latched=False
+        msg("FLOW RADAR RED CLEARED | NEW ENTRIES ENABLED",bal=False)
+    return False
+
+def scan():
+    global btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched,basket_lock_candle
+    if red_guard_active:return
+    if time.time()<pause_until:return
+    closed_candle=closed_candle_id("BTCUSDT")
+    if not closed_candle:return
+    ctx=btc_context()
+    old_mode=btc_mode
+    btc_mode=ctx["bias"]
+    logging.info("BTC CONTEXT: %s | score %.2f | taker-buy %.3f | vol %.2f | NOT A HARD GATE",
+                 ctx["bias"],ctx["score"],ctx.get("buy_ratio",.5),ctx.get("vol_ratio",1))
+    # Telegram only when the BTC market state changes; never spam every scan.
+    if btc_mode != old_mode:
+        direction_text = ("New positions: LONG only" if btc_mode=="LONG" else
+                          "New positions: SHORT only" if btc_mode=="SHORT" else
+                          "New positions: LONG or SHORT by setup score")
+        msg(f"BTC MARKET CHANGE: {old_mode} -> {btc_mode}\n{direction_text}\nExisting positions continue with Profit Lock / SL / TP", bal=False)
+        save()
+    if closed_candle!=entry_candle:
+        entry_candle=closed_candle; entries_this_candle=0; save()
+    limit=min(max(0,2-entries_this_candle),max(0,MAX_POS-risk_position_count()))
+    if limit<=0:return
+    candidates=[]
+    for s in universe():
+        if s in mine:continue
+        try:
+            # V2.1: market direction controls NEW slots only. Existing positions are never
+            # force-closed on a BTC context flip; they keep their own SL/TP management.
+            if ctx["bias"] in ("SHORT","NEUTRAL"):
+                sh=short_engine(s,ctx)
+                if sh:candidates.append((float(sh["score"]),s,sh))
+            if ctx["bias"] in ("LONG","NEUTRAL"):
+                lo=long_engine(s,ctx)
+                if lo:candidates.append((float(lo["score"]),s,lo))
+        except Exception as e:logging.warning("%s scoring failed: %s",s,e)
+    candidates.sort(key=lambda x:x[0],reverse=True)
+    opened=0; used=set()
+    for score,s,setup in candidates:
+        if opened>=limit:break
+        if s in used or s in mine:continue
+        try:
+            enter(s,setup["side"],setup,ctx)
+            # enter() writes mine only after a successful protected entry.
+            if s in mine:
+                opened+=1; entries_this_candle+=1; used.add(s); save()
+                logging.info("SELECTED %s %s | score %.2f | %s",setup["side"],s,score,setup["details"])
+        except Exception as e:logging.warning("%s entry failed: %s",s,e)
+    logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s | RISK SLOTS %s/%s",
+                 closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),risk_position_count(),MAX_POS)
+
+def main():
+    if not KEY or not SECRET:raise RuntimeError("Missing Binance LIVE API keys")
+    exchange_info(); load()
+    # Never adopt unknown positions: safe for other bots on same account.
+    ps=positions()
+    for s in list(mine):
+        if s not in ps:mine.pop(s,None)
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $100 | Max: 30 | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    last=0
+    while True:
+        try:
+            if red_guard_tick():
+                time.sleep(5)
+                continue
+            manage()
+            if time.time()-last>=20:scan();last=time.time()
+            time.sleep(5)
+        except Exception as e:
+            logging.exception(e);time.sleep(5)
+if __name__=="__main__":main()
