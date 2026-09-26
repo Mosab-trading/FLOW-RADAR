@@ -911,7 +911,6 @@ def scan():
                  closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),risk_position_count(),MAX_POS)
 
 def main():
-    if not KEY or not SECRET:raise RuntimeError("Missing Binance LIVE API keys")
     exchange_info(); load()
     # Never adopt unknown positions: safe for other bots on same account.
     ps=positions()
