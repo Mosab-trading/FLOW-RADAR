@@ -12,6 +12,8 @@ PREMOVE_SCAN_SECONDS=int(os.getenv("PREMOVE_SCAN_SECONDS","15")); PREMOVE_MIN_SC
 PREMOVE_STRONG_SCORE=float(os.getenv("PREMOVE_STRONG_SCORE","72")); PREMOVE_MIN_24H_QUOTE=float(os.getenv("PREMOVE_MIN_24H_QUOTE","5000000"))
 PREMOVE_QUIET_5M=float(os.getenv("PREMOVE_QUIET_5M","1.25")); PREMOVE_MAX_15M=float(os.getenv("PREMOVE_MAX_15M","2.25")); PREMOVE_MAX_1H=float(os.getenv("PREMOVE_MAX_1H","4.50"))
 PREMOVE_STATE=defaultdict(lambda:deque(maxlen=12)); PREMOVE_MARKET={}; PREMOVE_LAST_PRINT=0.0
+MOMENTUM_VERBOSE=os.getenv("MOMENTUM_VERBOSE","0").lower() in ("1","true","yes")
+VENUE_VERBOSE=os.getenv("VENUE_VERBOSE","0").lower() in ("1","true","yes")
 VENUE_AVAILABLE=defaultdict(set)  # symbol -> available venue families
 TRADFI_BASES={x.strip().upper() for x in os.getenv("PREMOVE_TRADFI_BASES","AAPL,AMZN,GOOG,GOOGL,META,MSFT,NVDA,TSLA,COIN,MSTR,SPX,SP500,NDX,NASDAQ,DJI,DOW,XAU,XAG,GOLD,SILVER,WTI,BRENT").split(",") if x.strip()}
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
@@ -199,16 +201,16 @@ async def load_meta():
    if ccy and ccy not in (base,"USD"):
     raise ValueError(f"unexpected ctValCcy={ccy}")
    multipliers[("OKX",inst)]=cv*cm; VENUE_AVAILABLE[sym].add("OKX"); okx_ok+=1
-   print("OKX META OK",sym,inst,"ctVal=",cv,"ctMult=",cm,"mult=",cv*cm,"ccy=",ccy)
+   VENUE_VERBOSE and print("OKX META OK",sym,inst,"ctVal=",cv,"ctMult=",cm,"mult=",cv*cm,"ccy=",ccy)
   except Exception as e:
-   okx_skip.append(sym); print("OKX META SKIP",sym,repr(e))
+   okx_skip.append(sym); VENUE_VERBOSE and print("OKX META SKIP",sym,repr(e))
  print("OKX CONTRACT META V3.9",okx_ok,"/",len(SYMBOLS),"loaded","skipped="+",".join(okx_skip) if okx_skip else "all-ok")
 
  # Safety fallback for the four original contracts only, preserving the original known values.
  fallback={"BTC-USDT-SWAP":0.01,"ETH-USDT-SWAP":0.1,"SOL-USDT-SWAP":1.0,"XRP-USDT-SWAP":100.0}
  for inst,m in fallback.items():
   if ("OKX",inst) not in multipliers:
-   multipliers[("OKX",inst)]=m; print("OKX META FALLBACK",inst,"mult=",m)
+   multipliers[("OKX",inst)]=m; VENUE_VERBOSE and print("OKX META FALLBACK",inst,"mult=",m)
 
  # Gate metadata unchanged.
  for s in SYMBOLS:
@@ -216,7 +218,7 @@ async def load_meta():
    c=s.replace("USDT","_USDT")
    x=await asyncio.to_thread(http_json,f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{c}")
    multipliers[("GATE",c)]=float(x["quanto_multiplier"]); VENUE_AVAILABLE[s].add("GATE")
-  except Exception as e: print("GATE META SKIP",s,repr(e))
+  except Exception as e: VENUE_VERBOSE and print("GATE META SKIP",s,repr(e))
 
 async def binance(s,spot):
  ex="BINANCE_SPOT" if spot else "BINANCE_FUTURES"
@@ -224,25 +226,25 @@ async def binance(s,spot):
  while 1:
   try:
    async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
-    print(ex,"CONNECTED",s); first=True
+    VENUE_VERBOSE and print(ex,"CONNECTED",s); first=True
     async for r in w:
      x=json.loads(r)
-     if first:print(ex,"DATA OK",s);first=False
+     if first: VENUE_VERBOSE and print(ex,"DATA OK",s); first=False
      p=float(x["p"]);q=float(x["q"]);add(ex,s,p,q,"SELL" if x.get("m") else "BUY",x.get("T",x.get("E",time.time()*1000))/1000)
-  except Exception as e:print(ex,"reconnect",s,repr(e));await asyncio.sleep(3)
+  except Exception as e: VENUE_VERBOSE and print(ex,"reconnect",s,repr(e)); await asyncio.sleep(3)
 
 async def bybit(s,spot):
  ex="BYBIT_SPOT" if spot else "BYBIT_FUTURES"; u="wss://stream.bybit.com/v5/public/"+("spot" if spot else "linear")
  while 1:
   try:
    async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
-    await w.send(json.dumps({"op":"subscribe","args":[f"publicTrade.{s}"]}));print(ex,"CONNECTED",s);first=True
+    await w.send(json.dumps({"op":"subscribe","args":[f"publicTrade.{s}"]})); VENUE_VERBOSE and print(ex,"CONNECTED",s); first=True
     async for r in w:
      x=json.loads(r)
      for z in x.get("data",[]):
-      if first:print(ex,"DATA OK",s);first=False
+      if first: VENUE_VERBOSE and print(ex,"DATA OK",s); first=False
       add(ex,s,float(z["p"]),float(z["v"]),"BUY" if z["S"]=="Buy" else "SELL",int(z["T"])/1000)
-  except Exception as e:print(ex,"reconnect",s,repr(e));await asyncio.sleep(3)
+  except Exception as e: VENUE_VERBOSE and print(ex,"reconnect",s,repr(e)); await asyncio.sleep(3)
 
 async def okx(s,spot):
  ex="OKX_SPOT" if spot else "OKX_FUTURES"; inst=s.replace("USDT","-USDT")+("" if spot else "-SWAP")
@@ -253,26 +255,26 @@ async def okx(s,spot):
    async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
     arg={"channel":channel,"instId":inst}
     await w.send(json.dumps({"op":"subscribe","args":[arg]}))
-    print(ex,"CONNECTED",s,"channel="+channel,"instId="+inst)
+    VENUE_VERBOSE and print(ex,"CONNECTED",s,"channel="+channel,"instId="+inst)
     first=True; diag=0
     async for r in w:
      x=json.loads(r)
      if x.get("event") in ("subscribe","error"):
-      print(ex,"OKX RESPONSE",s,json.dumps(x,separators=(",",":"))[:1000])
+      VENUE_VERBOSE and print(ex,"OKX RESPONSE",s,json.dumps(x,separators=(",",":"))[:1000])
       continue
      rows=x.get("data",[])
      if not rows: continue
      if diag<2:
-      print(ex,"RAW DATA",s,json.dumps(rows[0],separators=(",",":"))[:1000]);diag+=1
+      VENUE_VERBOSE and print(ex,"RAW DATA",s,json.dumps(rows[0],separators=(",",":"))[:1000]);diag+=1
      for z in rows:
       p=float(z["px"]); q=float(z["sz"])
       if not spot:
        m=multipliers.get(("OKX",inst))
        if not m:
-        print(ex,"SKIP NO ctVal",s,inst,"raw_sz="+str(z.get("sz")))
+        VENUE_VERBOSE and print(ex,"SKIP NO ctVal",s,inst,"raw_sz="+str(z.get("sz")))
         continue
        q*=m
-      if first:print(ex,"DATA OK",s,"ctVal="+str(multipliers.get(("OKX",inst),"SPOT")));first=False
+      if first: VENUE_VERBOSE and print(ex,"DATA OK",s,"ctVal="+str(multipliers.get(("OKX",inst),"SPOT"))); first=False
       add(ex,s,p,q,z["side"].upper(),int(z["ts"])/1000)
   except Exception as e:
    print(ex,"reconnect",s,repr(e));await asyncio.sleep(3)
@@ -284,13 +286,13 @@ async def gate(s,spot):
  while 1:
   try:
    async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
-    await w.send(json.dumps({"time":int(time.time()),"channel":ch,"event":"subscribe","payload":[c]}));print(ex,"CONNECTED",s);first=True
+    await w.send(json.dumps({"time":int(time.time()),"channel":ch,"event":"subscribe","payload":[c]})); VENUE_VERBOSE and print(ex,"CONNECTED",s); first=True
     async for r in w:
      x=json.loads(r)
      if x.get("event")!="update":continue
      rows=x.get("result",[]); rows=rows if isinstance(rows,list) else [rows]
      for z in rows:
-      if first:print(ex,"DATA OK",s);first=False
+      if first: VENUE_VERBOSE and print(ex,"DATA OK",s); first=False
       p=float(z["price"])
       if spot:q=float(z["amount"]);side=z["side"].upper();ts=float(z.get("create_time_ms",time.time()*1000))/1000
       else:
@@ -298,7 +300,7 @@ async def gate(s,spot):
        if not m:continue
        q=abs(size)*m;side="BUY" if size>0 else "SELL";ts=float(z.get("create_time_ms",time.time()*1000))/1000
       add(ex,s,p,q,side,ts)
-  except Exception as e:print(ex,"reconnect",s,repr(e));await asyncio.sleep(3)
+  except Exception as e: VENUE_VERBOSE and print(ex,"reconnect",s,repr(e)); await asyncio.sleep(3)
 
 def flow(s,seconds=W,ex=None):
  n=time.time();b=se=0.;c=0
@@ -323,7 +325,7 @@ def detect(s):
  p=price(s)
  if not p:return
  last[(s,direction)]=n;pending.append({"ts":n,"s":s,"dir":direction,"entry":p,"b":b,"sell":se,"d":d,"im":im,"r":{}})
- print(f"EVENT {s} {direction} entry={p} delta=${d:,.0f} imbalance={im:+.1f}%")
+ MOMENTUM_VERBOSE and print(f"EVENT {s} {direction} entry={p} delta=${d:,.0f} imbalance={im:+.1f}%")
 
 def outcomes():
  n=time.time()
@@ -336,7 +338,7 @@ def outcomes():
     w=csv.writer(f)
     if new:w.writerow(["time","symbol","direction","entry","buy_usd","sell_usd","delta","imbalance","ret5","ret30","ret60","ret300"])
     w.writerow([e["ts"],e["s"],e["dir"],e["entry"],e["b"],e["sell"],e["d"],e["im"],r["5"],r["30"],r["60"],r["300"]])
-   print(f'RESULT {e["s"]} {e["dir"]} 5s={r["5"]:+.3f}% 30s={r["30"]:+.3f}% 60s={r["60"]:+.3f}% 300s={r["300"]:+.3f}%');pending.remove(e)
+   MOMENTUM_VERBOSE and print(f'RESULT {e["s"]} {e["dir"]} 5s={r["5"]:+.3f}% 30s={r["30"]:+.3f}% 60s={r["60"]:+.3f}% 300s={r["300"]:+.3f}%');pending.remove(e)
 
 def remember_confirm(s,p,sd,fd,ad,ai,gbuy,gsell,vbuy,vsell):
  h=flow_history[s]; n=time.time()
@@ -539,7 +541,7 @@ def score_outcomes():
     w.writerow([e["ts"],e["s"],e["p"],e["score"],e["regime"],e["flow"],e["confirm"],e["pricepart"],e["btc"],e["breadth"],e["rs"],r["30"],r["60"],r["180"],r["300"],r["900"]])
    base=calibration_baseline(e["market_regime"],180)
    bt=(f"baseline3m(n={base['n']} up={base['up']:.1f}% down={base['down']:.1f}% avg={base['avg']:+.3f}%)" if base else "baseline3m=WARMING")
-   print(f'SCORE RESULT {e["s"]} score={e["score"]:+d} market={e["market_regime"]} 30s={r["30"]:+.3f}% 60s={r["60"]:+.3f}% 3m={r["180"]:+.3f}% 5m={r["300"]:+.3f}% 15m={r["900"]:+.3f}% | MFE3m={m["180"]:+.3f}% MAE3m={q["180"]:+.3f}% | {bt}')
+   MOMENTUM_VERBOSE and print(f'SCORE RESULT {e["s"]} score={e["score"]:+d} market={e["market_regime"]} 30s={r["30"]:+.3f}% 60s={r["60"]:+.3f}% 3m={r["180"]:+.3f}% 5m={r["300"]:+.3f}% 15m={r["900"]:+.3f}% | MFE3m={m["180"]:+.3f}% MAE3m={q["180"]:+.3f}% | {bt}')
    score_pending.remove(e)
 
 def fast_setup(s):
@@ -661,36 +663,37 @@ async def telegram_reporter_tick():
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== MOMENTUM | FLOW RADAR V5.1 | {W}s | FLOW CONFIRM ===")
-  for s in SYMBOLS:
-   print(f"\n{s} price={price(s)}")
+  await asyncio.sleep(5)
+  if MOMENTUM_VERBOSE: print(f"\n=== MOMENTUM | FLOW RADAR V5.1 | {W}s | FLOW CONFIRM ===")
+  for sym in SYMBOLS:
    votes=[]
+   if MOMENTUM_VERBOSE: print(f"\n{sym} price={price(sym)}")
    for ex in spot+fut:
-    b,se,d,im,c=flow(s,W,ex);print(f" {ex:<17} B=${b:,.0f} S=${se:,.0f} D=${d:,.0f} IMB={im:+.1f}% n={c}")
+    b,se,d,im,c=flow(sym,W,ex)
+    if MOMENTUM_VERBOSE: print(f" {ex:<17} B=${b:,.0f} S=${se:,.0f} D=${d:,.0f} IMB={im:+.1f}% n={c}")
     if b+se>=1000:votes.append("BUY" if d>0 else "SELL")
-   sb,ss,sd,si,sc=group(s,spot);fb,fs,fd,fi,fc=group(s,fut);ab,ase,ad,ai,ac=flow(s)
-   print(f" SPOT TOTAL        D=${sd:,.0f} IMB={si:+.1f}% B=${sb:,.0f} S=${ss:,.0f}")
-   print(f" FUTURES TOTAL     D=${fd:,.0f} IMB={fi:+.1f}% B=${fb:,.0f} S=${fs:,.0f}")
-   print(f" GLOBAL FLOW       D=${ad:,.0f} IMB={ai:+.1f}% B=${ab:,.0f} S=${ase:,.0f}")
-   print(f" AGREEMENT         BUY={votes.count('BUY')}/{len(votes)} SELL={votes.count('SELL')}/{len(votes)} active feeds")
-   remember_confirm(s,price(s),sd,fd,ad,ai,ab,ase,votes.count("BUY"),votes.count("SELL"))
-   print(" "+confirm(s,15))
-   print(" "+confirm(s,30))
-   print(" "+confirm(s,60))
-   fs=flow_score(s)
+   sb,ss,sd,si,sc=group(sym,spot)
+   fb,ffs,fd,fi,fc=group(sym,fut)
+   ab,ase,ad,ai,ac=flow(sym)
+   remember_confirm(sym,price(sym),sd,fd,ad,ai,ab,ase,votes.count("BUY"),votes.count("SELL"))
+   fs=flow_score(sym)
    if fs:
-    print(f" FLOW SCORE        {fs['score']:+d}/100 | {fs['regime']} | flow={fs['flow']:+.1f} confirm={fs['confirm']:+.1f} price={fs['price']:+.1f} btc={fs['btc']:+.1f} breadth={fs['breadth']:+.1f} | RS60={fs['rs']:+.3f}% valid={fs['bvalid']} | 30s={fs['m30']} 60s={fs['m60']} | REPORT-ONLY")
-    record_score(s,fs)
-   setup=fast_setup(s)
-   if setup: print(" "+setup)
-   detect(s)
-  print("\n "+alt_breadth(30))
-  print(" "+alt_breadth(60))
+    if MOMENTUM_VERBOSE:
+     print(f" FLOW SCORE        {fs['score']:+d}/100 | {fs['regime']} | flow={fs['flow']:+.1f} confirm={fs['confirm']:+.1f} price={fs['price']:+.1f} btc={fs['btc']:+.1f} breadth={fs['breadth']:+.1f} | RS60={fs['rs']:+.3f}% valid={fs['bvalid']} | 30s={fs['m30']} 60s={fs['m60']} | REPORT-ONLY")
+    record_score(sym,fs)
+   if MOMENTUM_VERBOSE:
+    setup=fast_setup(sym)
+    if setup: print(" "+setup)
+    detect(sym)
+  if MOMENTUM_VERBOSE:
+   print("\n "+alt_breadth(30))
+   print(" "+alt_breadth(60))
   print_premove_top()
   await telegram_reporter_tick()
-  outcomes(); score_outcomes()
+  outcomes()
+  score_outcomes()
 async def main():
- print("FLOW RADAR V5.1 STARTED | MOMENTUM + PREMOVE | 4-VENUE FLOW | NON-BLOCKING METADATA | READ-ONLY | PREMOVE NO ORDER ROUTING")
+ print("FLOW RADAR V5.1 STARTED | PREMOVE TOP-10 QUIET LOG | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
  await load_binance_universe()
  # Optional exchange metadata runs in background so PREMOVE starts immediately.
  if TG_TOKEN and TG_CHAT_ID:
