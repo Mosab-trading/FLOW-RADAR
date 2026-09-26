@@ -2,6 +2,11 @@ import asyncio,json,os,time,csv,urllib.request
 from collections import defaultdict,deque
 from pathlib import Path
 import websockets
+import aiohttp
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",")]
 ALT_CORE=[x.strip().upper() for x in os.getenv("ALT_CORE","APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",") if x.strip()]
@@ -361,6 +366,161 @@ def market_regime():
  bear=b30["move"]<0 and b60["move"]<0 and b60["sign"]<=0 and bm["valid"]>=3 and bm["net"]<=0 and bm["rs"]<=0
  return {"name":"BULL" if bull else "BEAR" if bear else "SIDEWAYS","btc30":b30["move"],"btc60":b60["move"],"net":bm["net"],"rs":bm["rs"]}
 
+async def fetch_market_context():
+    """Fetch BTC price, dominance, 24h market change from CoinGecko with Binance fallback. Returns None on both failures."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.coingecko.com/api/v3/global"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "btc_price": data.get("data", {}).get("bitcoin", {}).get("usd"),
+                        "btc_dominance": data.get("data", {}).get("btc_market_cap_percentage"),
+                        "market_24h_change": data.get("data", {}).get("market_cap_change_percentage_24h_usd"),
+                        "source": "coingecko"
+                    }
+    except Exception as e:
+        print(f"MARKET CONTEXT: CoinGecko failed: {repr(e)}")
+    
+    # Fallback to Binance
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "btc_price": float(data.get("lastPrice")),
+                        "btc_dominance": None,
+                        "market_24h_change": float(data.get("priceChangePercent")),
+                        "source": "binance"
+                    }
+    except Exception as e:
+        print(f"MARKET CONTEXT: Binance fallback failed: {repr(e)}")
+    
+    return None
+
+async def send_telegram(text):
+    """Send text message to Telegram. Failures are logged and do not crash Flow Radar."""
+    if not TELEGRAM_ENABLED:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                ok = resp.status == 200
+                if ok:
+                    print(f"TELEGRAM: message sent")
+                else:
+                    print(f"TELEGRAM: send failed, status={resp.status}")
+                return ok
+    except Exception as e:
+        print(f"TELEGRAM: send error: {repr(e)}")
+        return False
+
+def classify_regime(btc30, btc60, breadth_net, breadth_rs, breadth_valid, score_btc):
+    """Classify market regime conservatively. RED only when sustained downside + negative RS; GREEN only when sustained upside + positive RS."""
+    # RED: sustained downside (30s + 60s negative), breadth selling, negative RS, sufficient data
+    if btc30 < 0 and btc60 < 0 and breadth_net < -0.3 and breadth_rs < -1.0 and breadth_valid >= 4:
+        return {"color": "RED", "reason": "sustained downside + selling breadth + negative RS"}
+    
+    # GREEN: sustained upside (30s + 60s positive), breadth buying, positive RS, sufficient data
+    if btc30 > 0 and btc60 > 0 and breadth_net > 0.3 and breadth_rs > 1.0 and breadth_valid >= 4:
+        return {"color": "GREEN", "reason": "sustained upside + buying breadth + positive RS"}
+    
+    # YELLOW: weak conviction or transition (low valid count, mixed signals, weak RS)
+    if breadth_valid < 3 or (abs(breadth_net) < 0.2 and abs(breadth_rs) < 1.0):
+        return {"color": "YELLOW", "reason": "insufficient data or weak signals"}
+    
+    # ORANGE: everything else (sideways, unclear)
+    return {"color": "ORANGE", "reason": "sideways/unclear"}
+
+telegram_regime_state = {"last_color": None, "last_change_time": 0, "last_hourly_time": 0, "startup_sent": False}
+
+async def telegram_market_regime_reporter():
+    """Report market regime changes to Telegram. Runs every 60s; sends only on change or hourly summary."""
+    if not TELEGRAM_ENABLED:
+        return
+    
+    now = time.time()
+    state = telegram_regime_state
+    
+    # Check if enough time has passed to avoid spam (min 60s between checks)
+    if now - state.get("last_change_time", 0) < 60:
+        return
+    
+    try:
+        # Gather metrics
+        b30 = window_metrics("BTCUSDT", 30)
+        b60 = window_metrics("BTCUSDT", 60)
+        bm = breadth_metrics(60)
+        mr = market_regime()
+        fs = flow_score("BTCUSDT")
+        ctx = await fetch_market_context()
+        
+        if not b30 or not b60 or not mr:
+            return
+        
+        # Classify regime
+        regime = classify_regime(
+            btc30=b30["move"], btc60=b60["move"],
+            breadth_net=bm["net"], breadth_rs=bm["rs"],
+            breadth_valid=bm["valid"],
+            score_btc=(fs["btc"] if fs else 0)
+        )
+        color = regime["color"]
+        
+        # Check if regime changed or hourly summary due
+        regime_changed = color != state.get("last_color")
+        hourly_due = now - state.get("last_hourly_time", 0) > 3600
+        
+        # Prepare message only if sending
+        if regime_changed or hourly_due:
+            # Format breadth counts
+            if bm["valid"] >= 3:
+                net_count = int(bm["net"] * bm["valid"])
+                breadth_str = f"net={net_count:+d} (out of {bm['valid']})"
+            else:
+                breadth_str = f"[warming, {bm['valid']} valid]"
+            
+            # BTC prices
+            btc_p = price("BTCUSDT")
+            dom_str = f"{ctx['btc_dominance']:.1f}%" if ctx and ctx.get("btc_dominance") else "N/A"
+            change_str = f"{ctx['market_24h_change']:+.1f}%" if ctx and ctx.get("market_24h_change") is not None else "N/A"
+            
+            # Construct message
+            emoji = {"RED": "🔴", "YELLOW": "🟡", "ORANGE": "🟠", "GREEN": "🟢"}[color]
+            prev_color = state.get("last_color", "NONE")
+            
+            msg = f"{emoji} <b>REGIME: {color}</b> (from {prev_color})\n"
+            msg += f"📊 BTC ${btc_p:,.0f} | 30s: {b30['move']:+.2f}% | 60s: {b60['move']:+.2f}%\n"
+            msg += f"📈 Breadth: {breadth_str} | RS: {bm['rs']:+.2f}%\n"
+            msg += f"🌐 DOM: {dom_str} | Market 24h: {change_str}"
+            
+            if bm["valid"] < 5 or abs(bm["rs"]) < 1.0:
+                msg += "\n⚠️ Direction is NOT CERTAIN (low sample or weak RS)"
+            
+            # Send and update state
+            await send_telegram(msg)
+            state["last_change_time"] = now
+            
+            if regime_changed:
+                state["last_color"] = color
+            if hourly_due:
+                state["last_hourly_time"] = now
+        
+        # Startup message
+        if not state.get("startup_sent"):
+            startup_msg = "✅ Flow Radar Telegram reporter started. Market context: live."
+            await send_telegram(startup_msg)
+            state["startup_sent"] = True
+    
+    except Exception as e:
+        print(f"TELEGRAM REPORTER ERROR: {repr(e)}")
+        # Do NOT re-raise; failures must not crash Flow Radar
+
 def calibration_baseline(regime,horizon):
  if not CALIB.exists():return None
  try:
@@ -446,7 +606,11 @@ def fast_setup(s):
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V4.1 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
+  await asyncio.sleep(5)
+  # Run Telegram reporter every 60s
+  if int(time.time()) % 60 == 0:
+    await telegram_market_regime_reporter()
+  print(f"\n=== FLOW RADAR V4.1 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
