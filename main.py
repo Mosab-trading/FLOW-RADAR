@@ -14,6 +14,31 @@ flow_history=defaultdict(lambda:deque(maxlen=120))
 setup_last={}
 score_pending=[]; score_last={}
 
+# PREMOVE Scanner state
+PREMOVE_ENABLED=os.getenv("PREMOVE_ENABLED","true").lower()=="true"
+PREMOVE_EXCLUDE=[x.strip().upper() for x in os.getenv("PREMOVE_EXCLUDE","BTCUSDT,ETHUSDT,SOLUSDT,STXUSDT,ATOMUSDT,XRPUSDT,SEIUSDT,SUIUSDT,TIAUSDT,INJUSDT,APTUSDT,NEARUSDT").split(",") if x.strip()]
+PREMOVE_MIN_VOLUME_24H=float(os.getenv("PREMOVE_MIN_VOLUME_24H","100000"))
+PREMOVE_REJECT_5M_PCT=float(os.getenv("PREMOVE_REJECT_5M_PCT","2.5"))
+PREMOVE_REJECT_15M_PCT=float(os.getenv("PREMOVE_REJECT_15M_PCT","4.0"))
+PREMOVE_REJECT_1H_PCT=float(os.getenv("PREMOVE_REJECT_1H_PCT","6.0"))
+PREMOVE_MIN_SCORE=float(os.getenv("PREMOVE_MIN_SCORE","25"))
+PREMOVE_MIN_CYCLES=int(os.getenv("PREMOVE_MIN_CYCLES","3"))
+PREMOVE_SCORE_STRONG=float(os.getenv("PREMOVE_SCORE_STRONG","65"))
+PREMOVE_PRICE_QUIET_1H=float(os.getenv("PREMOVE_PRICE_QUIET_1H","1.0"))
+PREMOVE_USE_OI_DATA=os.getenv("PREMOVE_USE_OI_DATA","true").lower()=="true"
+PREMOVE_WATCHLIST_TTL=int(os.getenv("PREMOVE_WATCHLIST_TTL","3600"))
+PREMOVE_BREAKOUT_THRESHOLD=float(os.getenv("PREMOVE_BREAKOUT_THRESHOLD","3.0"))
+PREMOVE_TELEGRAM_ENABLE=os.getenv("PREMOVE_TELEGRAM_ENABLE","false").lower()=="true"
+PREMOVE_TELEGRAM_MIN_SCORE=float(os.getenv("PREMOVE_TELEGRAM_MIN_SCORE","45"))
+PREMOVE_TELEGRAM_MIN_CYCLES=int(os.getenv("PREMOVE_TELEGRAM_MIN_CYCLES","2"))
+PREMOVE_SCAN_INTERVAL=int(os.getenv("PREMOVE_SCAN_INTERVAL","30"))
+PREMOVE_CANDIDATES=D/"premove_candidates.csv"
+
+scan_symbols=[]
+premove_watchlist={}
+last_premove_discovery=0.0
+last_premove_tg={}
+
 def add(ex,s,p,base_qty,side,ts):
  usd=p*base_qty
  t={"ts":ts,"ex":ex,"s":s,"p":p,"qty":base_qty,"usd":usd,"side":side};buf[s].append(t)
@@ -22,6 +47,25 @@ def add(ex,s,p,base_qty,side,ts):
 def http_json(url):
  req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 FlowRadar/3.9","Accept":"application/json"})
  with urllib.request.urlopen(req,timeout=15) as r:return json.loads(r.read())
+
+async def discover_scan_symbols():
+ """Fetch all Binance USDT-M perps, exclude restricted list."""
+ global scan_symbols,last_premove_discovery
+ n=time.time()
+ if n-last_premove_discovery<600 and scan_symbols: return  # cache 10m
+ try:
+  x=await asyncio.to_thread(http_json,"https://fapi.binance.com/fapi/v1/exchangeInfo")
+  symbols=[]
+  for z in x.get("symbols",[]):
+   sym=z.get("symbol","")
+   if sym.endswith("USDT") and z.get("status")=="TRADING" and not z.get("isSpotTradingAllowed"):
+    if sym not in PREMOVE_EXCLUDE and not any(ex in sym for ex in ["_P","BUSD","-spot","DOWN","BULL","BEAR"]):
+     symbols.append(sym)
+  scan_symbols=sorted(symbols)
+  last_premove_discovery=n
+  print(f"PREMOVE DISCOVERY OK | {len(scan_symbols)} symbols")
+ except Exception as e:
+  print(f"PREMOVE DISCOVERY FAILED {repr(e)}")
 
 async def load_meta():
  # V3.9: OKX REST may return HTTP 403 from cloud IPs. Try REST first, then the public
@@ -353,6 +397,52 @@ def flow_score(s):
          "btc":round(btcpart,1),"breadth":round(breadthpart,1),"bvalid":bm["valid"],"rs":bm["rs"],
          "m30":m30["side"],"m60":m60["side"]}
 
+def premove_score(s):
+ """PREMOVE score (0-100). Detects early accumulation before breakout."""
+ n=time.time()
+ m5=window_metrics(s,300)  # 5m
+ m15=window_metrics(s,900)  # 15m
+ m1h=window_metrics(s,3600)  # 1h
+ if not all((m5,m15,m1h)): return None
+
+ # Multi-cycle flow trend (35 pts max)
+ trend_consistency=sum([m5["sign"]!=0,m15["sign"]!=0,m1h["sign"]!=0])
+ trend_aligned=sum([m5["sign"]==m15["sign"]!=0,m15["sign"]==m1h["sign"]!=0])
+ flowpart=10*trend_aligned+5*(trend_consistency-1) if trend_consistency>1 else 0
+
+ # Weighted imbalance + spot/fut agreement (25 pts)
+ wimb_strength=min(25,abs(m1h["wimb"])/2)
+ spot_fut_bonus=5 if m1h["aligned"] else 0
+ imbpart=wimb_strength+spot_fut_bonus
+
+ # Relative strength vs BTC (15 pts)
+ btc_m1h=window_metrics("BTCUSDT",3600)
+ rspart=0
+ if btc_m1h and s!="BTCUSDT":
+  if (m1h["move"]>btc_m1h["move"] and m1h["sign"]==btc_m1h["sign"]>0) or (m1h["move"]<btc_m1h["move"] and m1h["sign"]==btc_m1h["sign"]<0):
+   rspart=15
+  elif m1h["sign"]!=0 and btc_m1h["sign"]!=0 and m1h["sign"]==btc_m1h["sign"]:
+   rspart=8
+
+ # Price still quiet (10 pts) - key for pre-move
+ pricepart=10 if abs(m1h["move"])<PREMOVE_PRICE_QUIET_1H else max(0,10-abs(m1h["move"])*5)
+
+ # OI context (15 pts, non-directional)
+ oi_part=0
+ if PREMOVE_USE_OI_DATA:
+  try:
+   oi_data=http_json(f"https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol={s}&period=5m&limit=1")
+   if oi_data and len(oi_data)>0:
+    ratio=float(oi_data[0].get("longShortRatio",0))
+    if 0.95<ratio<1.05: oi_part=15  # quiet, balanced
+    elif 1.05<ratio<1.15 or 0.85<ratio<0.95: oi_part=10  # slight imbalance
+  except Exception: pass
+
+ raw=flowpart+imbpart+rspart+pricepart+oi_part
+ score=max(0,min(100,round(raw)))
+ side="LONG" if m1h["sign"]>0 else "SHORT" if m1h["sign"]<0 else "NEUTRAL"
+ return {"score":score,"side":side,"flow":round(flowpart,1),"imb":round(imbpart,1),"rs":round(rspart,1),"price":round(pricepart,1),"oi":round(oi_part,1),"m1h":m1h}
+
 def market_regime():
  """Calibration-only regime; FLOW SCORE itself is unchanged."""
  b30,b60=window_metrics("BTCUSDT",30),window_metrics("BTCUSDT",60); bm=breadth_metrics(60)
@@ -523,6 +613,105 @@ async def telegram_reporter_tick():
    reporter_state["last_hourly"]=n
 
 
+async def check_pump_rejection(s):
+ """Check 5m/15m/1h candles; reject if recent pump."""
+ try:
+  klines=await asyncio.to_thread(http_json,f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=30")
+  if not klines or len(klines)<3: return None
+  k5m_pct=(float(klines[-1][4])/float(klines[-1][1])-1)*100 if float(klines[-1][1])>0 else 0
+  k5m_avg=sum((float(x[4])/float(x[1])-1)*100 for x in klines[-3:])/3 if all(float(x[1])>0 for x in klines[-3:]) else 0
+
+  klines=await asyncio.to_thread(http_json,f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=15m&limit=30")
+  k15m_pct=(float(klines[-1][4])/float(klines[-1][1])-1)*100 if float(klines[-1][1])>0 else 0
+  k15m_avg=sum((float(x[4])/float(x[1])-1)*100 for x in klines[-3:])/3 if all(float(x[1])>0 for x in klines[-3:]) else 0
+
+  klines=await asyncio.to_thread(http_json,f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=1h&limit=30")
+  k1h_pct=(float(klines[-1][4])/float(klines[-1][1])-1)*100 if float(klines[-1][1])>0 else 0
+  k1h_avg=sum((float(x[4])/float(x[1])-1)*100 for x in klines[-3:])/3 if all(float(x[1])>0 for x in klines[-3:]) else 0
+
+  if k5m_pct>PREMOVE_REJECT_5M_PCT or k5m_avg>PREMOVE_REJECT_5M_PCT: return f"REJECT 5m={k5m_pct:.2f}%"
+  if k15m_pct>PREMOVE_REJECT_15M_PCT or k15m_avg>PREMOVE_REJECT_15M_PCT: return f"REJECT 15m={k15m_pct:.2f}%"
+  if k1h_pct>PREMOVE_REJECT_1H_PCT or k1h_avg>PREMOVE_REJECT_1H_PCT: return f"REJECT 1h={k1h_pct:.2f}%"
+  return None
+ except Exception as e:
+  print(f"PUMP CHECK FAILED {s} {repr(e)}")
+  return None
+
+async def premove_scan():
+ """Run PREMOVE scanner every N seconds; independent from MOMENTUM."""
+ await asyncio.sleep(15)  # warm-up
+ while 1:
+  try:
+   await discover_scan_symbols()
+   if not scan_symbols:
+    await asyncio.sleep(PREMOVE_SCAN_INTERVAL)
+    continue
+
+   n=time.time()
+   candidates=[]
+
+   for s in scan_symbols[:100]:  # rate limit: ~50 api req/min per cycle
+    # Reject pumped symbols
+    rejection=await check_pump_rejection(s)
+    if rejection:
+     if s in premove_watchlist: del premove_watchlist[s]
+     continue
+
+    ps=premove_score(s)
+    if not ps or ps["score"]<PREMOVE_MIN_SCORE: continue
+
+    # Track persistence
+    if s not in premove_watchlist:
+     premove_watchlist[s]={"score":ps["score"],"side":ps["side"],"cycles":1,"first_ts":n,"peak":ps["score"],"rejected":False}
+    else:
+     w=premove_watchlist[s]
+     if n-w["first_ts"]>PREMOVE_WATCHLIST_TTL: del premove_watchlist[s]; continue
+     w["cycles"]+=1
+     w["peak"]=max(w["peak"],ps["score"])
+     w["score"]=ps["score"]
+
+    w=premove_watchlist[s]
+    if w["cycles"]>=PREMOVE_MIN_CYCLES and ps["score"]>=PREMOVE_MIN_SCORE:
+     status="EARLY_LONG_WATCH" if ps["side"]=="LONG" else "EARLY_SHORT_WATCH" if ps["side"]=="SHORT" else "NOT_CONFIRMED"
+     if ps["score"]<45: status="NOT_CONFIRMED"
+     candidates.append((s,ps["score"],status,w["cycles"],ps))
+
+   candidates.sort(key=lambda x:(-x[1],-x[3]))
+
+   # Log top 10
+   if candidates:
+    new=not PREMOVE_CANDIDATES.exists()
+    with PREMOVE_CANDIDATES.open("a",newline="") as f:
+     wr=csv.writer(f)
+     if new: wr.writerow(["time","symbol","score","status","cycles","side","flow_pts","imb_pts","rs_pts","price_pts","oi_pts","price_1h_pct","reason"])
+     for s,sc,st,cy,ps in candidates[:10]:
+      wr.writerow([n,s,round(sc,1),st,cy,ps["side"],ps["flow"],ps["imb"],ps["rs"],ps["price"],ps["oi"],round(ps["m1h"]["move"],3),f"accumulation_{st.lower()}"])
+
+    print(f"\nPREMOVE TOP 10 | cycle={n:.0f}")
+    for i,(s,sc,st,cy,ps) in enumerate(candidates[:10],1):
+     print(f" {i}. {s} score={sc:.0f} {st} cycles={cy} | wimb={ps['m1h']['wimb']:+.1f}% | oi={ps['oi']:.0f}pts | price={ps['m1h']['move']:+.3f}%")
+
+    if PREMOVE_TELEGRAM_ENABLE:
+     await premove_telegram_report(candidates[:10],n)
+
+   await asyncio.sleep(PREMOVE_SCAN_INTERVAL)
+  except Exception as e:
+   print(f"PREMOVE SCAN ERROR {repr(e)}")
+   await asyncio.sleep(PREMOVE_SCAN_INTERVAL)
+
+async def premove_telegram_report(candidates,n):
+ """Optional Telegram report for PREMOVE candidates. Watch-only; never routes to order execution."""
+ lines=["🔎 PREMOVE WATCHLIST (report-only)"]
+ sent_any=False
+ for s,sc,st,cy,ps in candidates:
+  if sc<PREMOVE_TELEGRAM_MIN_SCORE or cy<PREMOVE_TELEGRAM_MIN_CYCLES: continue
+  if n-last_premove_tg.get(s,0)<PREMOVE_WATCHLIST_TTL: continue
+  lines.append(f"{s} score={sc:.0f} {st} cycles={cy} side={ps['side']} price={ps['m1h']['move']:+.3f}%")
+  last_premove_tg[s]=n
+  sent_any=True
+ if sent_any:
+  await telegram_send("\n".join(lines))
+
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
@@ -562,6 +751,7 @@ async def main():
  else:
   print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
  tasks=[report()]
+ if PREMOVE_ENABLED: tasks.append(premove_scan())
  for s in SYMBOLS:
   tasks += [binance(s,1),binance(s,0),bybit(s,1),bybit(s,0),okx(s,1),okx(s,0),gate(s,1),gate(s,0)]
  await asyncio.gather(*tasks)
