@@ -15,6 +15,9 @@ PREMOVE_STATE=defaultdict(lambda:deque(maxlen=12)); PREMOVE_MARKET={}; PREMOVE_L
 MOMENTUM_VERBOSE=os.getenv("MOMENTUM_VERBOSE","0").lower() in ("1","true","yes")
 VENUE_VERBOSE=os.getenv("VENUE_VERBOSE","0").lower() in ("1","true","yes")
 VENUE_AVAILABLE=defaultdict(set)  # symbol -> available venue families
+OKX_SPOT_SUPPORTED=set()
+OKX_FUT_SUPPORTED=set()
+OKX_DISCOVERY_READY=asyncio.Event()
 TRADFI_BASES={x.strip().upper() for x in os.getenv("PREMOVE_TRADFI_BASES","AAPL,AMZN,GOOG,GOOGL,META,MSFT,NVDA,TSLA,COIN,MSTR,SPX,SP500,NDX,NASDAQ,DJI,DOW,XAU,XAG,GOLD,SILVER,WTI,BRENT").split(",") if x.strip()}
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
 D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"; SCORES=D/"flow_scores.csv"; CALIB=D/"flow_score_regime_calibration.csv"
@@ -190,6 +193,20 @@ async def load_meta():
    print("OKX META WS",len(okx_rows),"/",len(targets))
   except Exception as e: print("OKX META WS FAILED",repr(e))
 
+ # Discover OKX SPOT separately. A futures contract existing on OKX does not mean
+ # the corresponding spot market exists. This prevents unsupported subscriptions/reconnect storms.
+ try:
+  sx=await asyncio.to_thread(http_json,"https://www.okx.com/api/v5/public/instruments?instType=SPOT")
+  wanted={s.replace("USDT","-USDT"):s for s in SYMBOLS}
+  for z in sx.get("data",[]):
+   inst=str(z.get("instId") or "")
+   state=str(z.get("state") or "live").lower()
+   if inst in wanted and state in ("live","trading"):
+    OKX_SPOT_SUPPORTED.add(wanted[inst])
+  print("OKX SPOT DISCOVERY",len(OKX_SPOT_SUPPORTED),"/",len(SYMBOLS))
+ except Exception as e:
+  print("OKX SPOT DISCOVERY FAILED",repr(e))
+
  okx_ok=0; okx_skip=[]
  for inst,sym in targets.items():
   try:
@@ -200,7 +217,7 @@ async def load_meta():
    if cv<=0: raise ValueError("missing ctVal")
    if ccy and ccy not in (base,"USD"):
     raise ValueError(f"unexpected ctValCcy={ccy}")
-   multipliers[("OKX",inst)]=cv*cm; VENUE_AVAILABLE[sym].add("OKX"); okx_ok+=1
+   multipliers[("OKX",inst)]=cv*cm; OKX_FUT_SUPPORTED.add(sym); VENUE_AVAILABLE[sym].add("OKX"); okx_ok+=1
    VENUE_VERBOSE and print("OKX META OK",sym,inst,"ctVal=",cv,"ctMult=",cm,"mult=",cv*cm,"ccy=",ccy)
   except Exception as e:
    okx_skip.append(sym); VENUE_VERBOSE and print("OKX META SKIP",sym,repr(e))
@@ -211,6 +228,12 @@ async def load_meta():
  for inst,m in fallback.items():
   if ("OKX",inst) not in multipliers:
    multipliers[("OKX",inst)]=m; VENUE_VERBOSE and print("OKX META FALLBACK",inst,"mult=",m)
+  sym=inst.replace("-USDT-SWAP","USDT")
+  if sym in SYMBOLS: OKX_FUT_SUPPORTED.add(sym); VENUE_AVAILABLE[sym].add("OKX")
+
+ # Release OKX collectors now; Gate metadata can continue independently afterwards.
+ OKX_DISCOVERY_READY.set()
+ print("OKX SUPPORTED | spot=",len(OKX_SPOT_SUPPORTED),"futures=",len(OKX_FUT_SUPPORTED))
 
  # Gate metadata unchanged.
  for s in SYMBOLS:
@@ -248,6 +271,13 @@ async def bybit(s,spot):
 
 async def okx(s,spot):
  ex="OKX_SPOT" if spot else "OKX_FUTURES"; inst=s.replace("USDT","-USDT")+("" if spot else "-SWAP")
+ # Wait for one metadata pass, then permanently skip unsupported OKX markets.
+ # This avoids endless 30-second no-data reconnect loops without affecting PREMOVE scoring.
+ await OKX_DISCOVERY_READY.wait()
+ supported=OKX_SPOT_SUPPORTED if spot else OKX_FUT_SUPPORTED
+ if s not in supported:
+  VENUE_VERBOSE and print(ex,"UNSUPPORTED SKIP",s,inst)
+  return
  u="wss://ws.okx.com:8443/ws/v5/public"
  channel="trades"
  while 1:
@@ -277,7 +307,7 @@ async def okx(s,spot):
       if first: VENUE_VERBOSE and print(ex,"DATA OK",s,"ctVal="+str(multipliers.get(("OKX",inst),"SPOT"))); first=False
       add(ex,s,p,q,z["side"].upper(),int(z["ts"])/1000)
   except Exception as e:
-   print(ex,"reconnect",s,repr(e));await asyncio.sleep(3)
+   VENUE_VERBOSE and print(ex,"reconnect",s,repr(e));await asyncio.sleep(3)
 
 async def gate(s,spot):
  ex="GATE_SPOT" if spot else "GATE_FUTURES"; c=s.replace("USDT","_USDT")
@@ -693,7 +723,7 @@ async def report():
   outcomes()
   score_outcomes()
 async def main():
- print("FLOW RADAR V5.1 STARTED | PREMOVE TOP-10 QUIET LOG | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
+ print("FLOW RADAR V5.2 STARTED | PREMOVE TOP-10 QUIET LOG | OKX SUPPORTED-MARKETS ONLY | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
  await load_binance_universe()
  # Optional exchange metadata runs in background so PREMOVE starts immediately.
  if TG_TOKEN and TG_CHAT_ID:
