@@ -1,4 +1,5 @@
-import asyncio,json,os,time,csv,urllib.request,urllib.parse,math
+import asyncio,json,os,time,csv,urllib.request,urllib.parse,math,threading
+from http.server import BaseHTTPRequestHandler,HTTPServer
 from collections import defaultdict,deque
 from pathlib import Path
 import websockets
@@ -618,6 +619,22 @@ TG_CHANGE_COOLDOWN=int(os.getenv("TELEGRAM_CHANGE_COOLDOWN","180"))
 TG_MIN_VALID=int(os.getenv("TELEGRAM_MIN_VALID","5"))
 reporter_state={"regime":None,"last_change":0.0,"last_hourly":0.0,"public":{},"public_ts":0.0}
 
+# --- RED STATE OUTPUT FOR LIVE BOT (does not alter indicator calculation) ---
+RED_STATE={"regime":"WARMING","ts":0.0}
+class _RedStateHandler(BaseHTTPRequestHandler):
+ def do_GET(self):
+  if self.path not in ("/","/state"):
+   self.send_response(404); self.end_headers(); return
+  body=json.dumps(RED_STATE,separators=(",",":")).encode()
+  self.send_response(200); self.send_header("Content-Type","application/json")
+  self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+ def log_message(self,format,*args): return
+
+def start_red_state_server():
+ port=int(os.getenv("PORT","8080"))
+ HTTPServer(("0.0.0.0",port),_RedStateHandler).serve_forever()
+
+
 def telegram_send_sync(text):
  try:
   if not TG_TOKEN or not TG_CHAT_ID:
@@ -680,7 +697,9 @@ def regime_message(snap,pub,reason):
 async def telegram_reporter_tick():
  snap=reporter_snapshot()
  if not snap:return
- n=time.time(); old=reporter_state["regime"]; changed=old is not None and snap["regime"]!=old
+ n=time.time()
+ RED_STATE["regime"]=snap["regime"]; RED_STATE["ts"]=n
+ old=reporter_state["regime"]; changed=old is not None and snap["regime"]!=old
  first=old is None; hourly=n-reporter_state["last_hourly"]>=TG_HOURLY
  if first or (changed and n-reporter_state["last_change"]>=TG_CHANGE_COOLDOWN) or hourly:
   pub=await public_market()
@@ -724,6 +743,7 @@ async def report():
   score_outcomes()
 async def main():
  print("FLOW RADAR V5.2 STARTED | PREMOVE TOP-10 QUIET LOG | OKX SUPPORTED-MARKETS ONLY | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
+ threading.Thread(target=start_red_state_server,daemon=True).start()
  await load_binance_universe()
  # Optional exchange metadata runs in background so PREMOVE starts immediately.
  if TG_TOKEN and TG_CHAT_ID:
