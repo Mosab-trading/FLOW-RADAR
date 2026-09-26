@@ -2,12 +2,27 @@ import asyncio,json,os,time,csv,urllib.request
 from collections import defaultdict,deque
 from pathlib import Path
 import websockets
+import aiohttp
+
+async def telegram_send(text,timeout=8):
+ try:
+  token=os.getenv("TELEGRAM_BOT_TOKEN"); cid=os.getenv("TELEGRAM_CHAT_ID")
+  if not token or not cid:return False
+  url=f"https://api.telegram.org/bot{token}/sendMessage"
+  async with aiohttp.ClientSession() as s:
+   async with s.post(url,json={"chat_id":cid,"text":text},timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+    return r.status==200
+ except Exception as e:
+  print(f"TELEGRAM ERROR: {repr(e)}")
+  return False
 
 SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",")]
 ALT_CORE=[x.strip().upper() for x in os.getenv("ALT_CORE","APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",") if x.strip()]
 ALT_MIN_AVG_USD=float(os.getenv("ALT_MIN_AVG_USD","1000")); ALT_MIN_AVG_FEEDS=float(os.getenv("ALT_MIN_AVG_FEEDS","2"))
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
 D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"; SCORES=D/"flow_scores.csv"; CALIB=D/"flow_score_regime_calibration.csv"
+telegram_regime_state={"last_regime":"","last_btc_price":0.0,"last_time":0,"last_send":0}
+telegram_context_cache={"btc_price":0,"market_cap_dom":0,"market_24h_change":0,"fetch_time":0}
 buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
 # V3.5 diagnostic confirmation layer; original EVENT/RESULT logic remains unchanged.
 flow_history=defaultdict(lambda:deque(maxlen=120))
@@ -443,10 +458,75 @@ def fast_setup(s):
          f"| weightedIMB={wimb:+.1f}% | agreement={agreement*100:.0f}% "
          f"| spotFut=YES | REPORT-ONLY")
 
+async def fetch_market_context():
+ n=time.time()
+ if n-telegram_context_cache["fetch_time"]<60:return telegram_context_cache
+ try:
+  async with aiohttp.ClientSession() as s:
+   async with s.get("https://api.coingecko.com/api/v3/global",timeout=aiohttp.ClientTimeout(total=5)) as r:
+    if r.status==200:
+     x=await r.json()
+     telegram_context_cache["btc_price"]=x.get("data",{}).get("btc_market_cap",{}).get("usd",0)
+     telegram_context_cache["market_cap_dom"]=x.get("data",{}).get("btc_dominance",0)
+     telegram_context_cache["market_24h_change"]=x.get("data",{}).get("market_cap_change_24h_usd",0)
+     telegram_context_cache["fetch_time"]=n
+ except Exception as e:
+  print(f"CONTEXT FETCH TIMEOUT: {repr(e)}")
+ return telegram_context_cache
+
+async def telegram_regime_reporter():
+ try:
+  mr=market_regime(); bm=breadth_metrics(60)
+  regime_name=mr["name"]
+  btc30=mr["btc30"]; btc60=mr["btc60"]; net=mr["net"]; rs=mr["rs"]
+  valid=bm["valid"]
+
+  if valid<3:emoji,color="⚫","GRAY"
+  elif regime_name=="BULL" and net>=0.3 and rs>=0.01 and valid>=5:emoji,color="🟢","GREEN"
+  elif regime_name=="BULL" and valid>=4:emoji,color="🟡","YELLOW"
+  elif regime_name=="SIDEWAYS" and valid>=3:emoji,color="🟠","ORANGE"
+  elif regime_name=="BEAR" and net<=-0.3 and rs<=-0.01 and valid>=5:emoji,color="🔴","RED"
+  else:emoji,color="⚫","GRAY"
+
+  state=telegram_regime_state
+  regime_changed=(regime_name!=state["last_regime"])
+  btc_moved=abs(btc30-state["last_btc_price"])/max(1,abs(state["last_btc_price"]))>0.15 if state["last_btc_price"] else False
+  net_moved=abs(net-state.get("last_net",0))>0.15
+  now=time.time()
+  should_send=regime_changed or btc_moved or net_moved or (now-state["last_send"]>3600)
+
+  if not should_send:return
+
+  ctx=await fetch_market_context()
+  btc_price=ctx["btc_price"]; dom=ctx["market_cap_dom"]
+  btc_str=f"${btc_price:,.0f}" if btc_price else "N/A"
+  dom_str=f"{dom:.1f}%" if dom else "N/A"
+
+  net_est=bm.get("positive",0)
+  pos=round(valid*net_est) if valid else 0
+  neg=valid-pos
+  breadth_str=f"+{pos}/-{neg}" if valid else "WARMING"
+  net_str=f"{net:+.2f}"
+  rs_str=f"{rs:+.2f}%"
+
+  sample_note=""
+  if valid<5:sample_note=f" | ⚠️ LOW SAMPLE ({valid}/{len(ALT_CORE)} alts)"
+
+  msg=(f"{emoji} REGIME: {regime_name} [{color}]{sample_note}\n"
+       f"📊 BTC: {btc_str} | Dom: {dom_str}\n"
+       f"📈 Breadth: {breadth_str} | Net: {net_str} | RS: {rs_str}")
+
+  await telegram_send(msg)
+  state["last_regime"]=regime_name; state["last_btc_price"]=btc30; state["last_net"]=net; state["last_send"]=now
+  print(f"TELEGRAM REGIME [{color}] {regime_name} sent (valid={valid})")
+ except Exception as e:
+  print(f"REGIME REPORTER ERROR: {repr(e)}")
+
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
   await asyncio.sleep(5);print(f"\n=== FLOW RADAR V4.1 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
+  if time.time()-telegram_regime_state["last_send"]>=60:await telegram_regime_reporter()
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -476,6 +556,7 @@ async def report():
 async def main():
  print("FLOW RADAR V4.1 STARTED | REGIME + BASELINE + MFE/MAE CALIBRATION | FLOW SCORE UNCHANGED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
  await load_meta()
+ await telegram_send("✅ FLOW RADAR TELEGRAM REPORTER ONLINE")
  tasks=[report()]
  for s in SYMBOLS:
   tasks += [binance(s,1),binance(s,0),bybit(s,1),bybit(s,0),okx(s,1),okx(s,0),gate(s,1),gate(s,0)]
