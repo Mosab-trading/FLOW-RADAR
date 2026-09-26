@@ -1,4 +1,4 @@
-import asyncio,json,os,time,csv,urllib.request
+import asyncio,json,os,time,csv,urllib.request,urllib.parse
 from collections import defaultdict,deque
 from pathlib import Path
 import websockets
@@ -442,6 +442,86 @@ def fast_setup(s):
          f"| persistence={persist*100:.0f}% | cumDelta=${cum:,.0f} "
          f"| weightedIMB={wimb:+.1f}% | agreement={agreement*100:.0f}% "
          f"| spotFut=YES | REPORT-ONLY")
+
+# --- Telegram market regime reporter (report-only; does not alter Flow Radar calculations) ---
+TG_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+TG_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID","").strip()
+TG_HOURLY=int(os.getenv("TELEGRAM_HOURLY_SECONDS","3600"))
+TG_CHANGE_COOLDOWN=int(os.getenv("TELEGRAM_CHANGE_COOLDOWN","180"))
+TG_MIN_VALID=int(os.getenv("TELEGRAM_MIN_VALID","5"))
+reporter_state={"regime":None,"last_change":0.0,"last_hourly":0.0,"public":{},"public_ts":0.0}
+
+def telegram_send_sync(text):
+ try:
+  if not TG_TOKEN or not TG_CHAT_ID:
+   print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID"); return False
+  data=urllib.parse.urlencode({"chat_id":TG_CHAT_ID,"text":text,"disable_web_page_preview":"true"}).encode()
+  req=urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",data=data,headers={"User-Agent":"FlowRadar-Telegram/1.0"})
+  with urllib.request.urlopen(req,timeout=10) as r:
+   ok=200<=getattr(r,"status",200)<300
+  print("TELEGRAM SENT" if ok else "TELEGRAM SEND FAILED"); return ok
+ except Exception as e:
+  print("TELEGRAM SEND ERROR",repr(e)); return False
+
+async def telegram_send(text):
+ return await asyncio.to_thread(telegram_send_sync,text)
+
+def public_market_sync():
+ try:
+  # CoinGecko global endpoint: no key required. Public context is secondary and failure-safe.
+  x=http_json("https://api.coingecko.com/api/v3/global").get("data",{})
+  pct=x.get("market_cap_percentage",{}) or {}; ch=x.get("market_cap_change_percentage_24h_usd")
+  return {"btc_dom":float(pct.get("btc",0) or 0),"market24":float(ch or 0)}
+ except Exception as e:
+  print("PUBLIC MARKET CONTEXT ERROR",repr(e)); return {}
+
+async def public_market():
+ n=time.time()
+ if n-reporter_state["public_ts"]>300:
+  reporter_state["public"]=await asyncio.to_thread(public_market_sync); reporter_state["public_ts"]=n
+ return reporter_state["public"]
+
+def reporter_snapshot():
+ b30=breadth_metrics(30); b60=breadth_metrics(60)
+ btc30=window_metrics("BTCUSDT",30); btc60=window_metrics("BTCUSDT",60); bfs=flow_score("BTCUSDT")
+ if not btc30 or not btc60:
+  return None
+ valid=min(b30["valid"],b60["valid"]); meaningful=valid>=TG_MIN_VALID
+ sell30=b30["net"]<=-.40 and b30["rs"]<0; sell60=b60["net"]<=-.40 and b60["rs"]<0
+ buy30=b30["net"]>=.40 and b30["rs"]>0; buy60=b60["net"]>=.40 and b60["rs"]>0
+ btc_weak=btc60["move"]<0 and (btc60["sign"]<0 or (bfs and bfs["score"]<=-35))
+ btc_stable=btc60["move"]>=-.08 and not (bfs and bfs["score"]<=-65)
+ if meaningful and sell30 and sell60 and (btc_weak or b60["rs"]<=-.15): regime="RED"
+ elif (sell30 and sell60) or (b60["rs"]<-.10 and b60["net"]<0) or btc_weak: regime="ORANGE"
+ elif meaningful and buy30 and buy60 and btc_stable and b60["positive"]>=.60: regime="GREEN"
+ else: regime="YELLOW"
+ return {"regime":regime,"b30":b30,"b60":b60,"btc30":btc30,"btc60":btc60,"btcfs":bfs,"valid":valid}
+
+def regime_message(snap,pub,reason):
+ icons={"GREEN":"🟢","YELLOW":"🟡","ORANGE":"🟠","RED":"🔴"}; r=snap["regime"]; b30=snap["b30"]; b60=snap["b60"]; bf=snap["btcfs"]
+ btcscore=(f"{bf['score']:+d}/100 {bf['regime']}" if bf else "warming")
+ dom=(f"{pub.get('btc_dom',0):.2f}%" if pub.get('btc_dom') else "N/A"); m24=(f"{pub.get('market24',0):+.2f}%" if pub.get('market24') is not None and pub else "N/A")
+ return (f"{icons[r]} FLOW RADAR — {r}\n"
+         f"Reason: {reason}\n"
+         f"BTC: ${price('BTCUSDT') or 0:,.2f} | 30s {snap['btc30']['move']:+.3f}% | 60s {snap['btc60']['move']:+.3f}%\n"
+         f"BTC Flow Score: {btcscore}\n"
+         f"ALT 30s: net={b30['net']:+.2f} | RS={b30['rs']:+.3f}% | valid={b30['valid']}/{len(ALT_CORE)}\n"
+         f"ALT 60s: net={b60['net']:+.2f} | RS={b60['rs']:+.3f}% | valid={b60['valid']}/{len(ALT_CORE)} | positive={b60['positive']*100:.0f}%\n"
+         f"BTC Dominance: {dom} | Total market 24h: {m24}\n"
+         f"REPORT-ONLY. Short-term flow can reverse; this is not a certain directional outcome.")
+
+async def telegram_reporter_tick():
+ snap=reporter_snapshot()
+ if not snap:return
+ n=time.time(); old=reporter_state["regime"]; changed=old is not None and snap["regime"]!=old
+ first=old is None; hourly=n-reporter_state["last_hourly"]>=TG_HOURLY
+ if first or (changed and n-reporter_state["last_change"]>=TG_CHANGE_COOLDOWN) or hourly:
+  pub=await public_market()
+  reason="STARTUP" if first else (f"REGIME CHANGE {old} -> {snap['regime']}" if changed else "HOURLY SUMMARY")
+  if await telegram_send(regime_message(snap,pub,reason)):
+   if first or changed: reporter_state["regime"]=snap["regime"]; reporter_state["last_change"]=n
+   reporter_state["last_hourly"]=n
+
 
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
