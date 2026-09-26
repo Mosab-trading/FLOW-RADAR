@@ -1,11 +1,18 @@
-import asyncio,json,os,time,csv,urllib.request,urllib.parse
+import asyncio,json,os,time,csv,urllib.request,urllib.parse,math
 from collections import defaultdict,deque
 from pathlib import Path
 import websockets
 
-SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",")]
-ALT_CORE=[x.strip().upper() for x in os.getenv("ALT_CORE","APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",") if x.strip()]
+SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT").split(",") if x.strip()]
+ALT_CORE=[]
 ALT_MIN_AVG_USD=float(os.getenv("ALT_MIN_AVG_USD","1000")); ALT_MIN_AVG_FEEDS=float(os.getenv("ALT_MIN_AVG_FEEDS","2"))
+PREMOVE_ENABLED=os.getenv("PREMOVE_ENABLED","1").lower() not in ("0","false","no")
+PREMOVE_TOP_N=int(os.getenv("PREMOVE_TOP_N","10")); PREMOVE_MIN_PERSIST=int(os.getenv("PREMOVE_MIN_PERSIST","3"))
+PREMOVE_SCAN_SECONDS=int(os.getenv("PREMOVE_SCAN_SECONDS","15")); PREMOVE_MIN_SCORE=float(os.getenv("PREMOVE_MIN_SCORE","58"))
+PREMOVE_STRONG_SCORE=float(os.getenv("PREMOVE_STRONG_SCORE","72")); PREMOVE_MIN_24H_QUOTE=float(os.getenv("PREMOVE_MIN_24H_QUOTE","5000000"))
+PREMOVE_QUIET_5M=float(os.getenv("PREMOVE_QUIET_5M","1.25")); PREMOVE_MAX_15M=float(os.getenv("PREMOVE_MAX_15M","2.25")); PREMOVE_MAX_1H=float(os.getenv("PREMOVE_MAX_1H","4.50"))
+PREMOVE_STATE=defaultdict(lambda:deque(maxlen=12)); PREMOVE_MARKET={}; PREMOVE_LAST_PRINT=0.0
+TRADFI_BASES={x.strip().upper() for x in os.getenv("PREMOVE_TRADFI_BASES","AAPL,AMZN,GOOG,GOOGL,META,MSFT,NVDA,TSLA,COIN,MSTR,SPX,SP500,NDX,NASDAQ,DJI,DOW,XAU,XAG,GOLD,SILVER,WTI,BRENT").split(",") if x.strip()}
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
 D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"; SCORES=D/"flow_scores.csv"; CALIB=D/"flow_score_regime_calibration.csv"
 buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
@@ -22,6 +29,95 @@ def add(ex,s,p,base_qty,side,ts):
 def http_json(url):
  req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 FlowRadar/3.9","Accept":"application/json"})
  with urllib.request.urlopen(req,timeout=15) as r:return json.loads(r.read())
+
+
+def is_crypto_perp(z):
+ sym=str(z.get("symbol") or "").upper(); base=str(z.get("baseAsset") or "").upper()
+ if not sym.endswith("USDT") or z.get("quoteAsset")!="USDT" or z.get("contractType")!="PERPETUAL" or z.get("status")!="TRADING": return False
+ if base in TRADFI_BASES:return False
+ return not any(k in (base+" "+sym) for k in ("STOCK","INDEX","GOLD","SILVER","NASDAQ","SP500"))
+
+async def load_binance_universe():
+ global SYMBOLS,ALT_CORE
+ try:
+  info=await asyncio.to_thread(http_json,"https://fapi.binance.com/fapi/v1/exchangeInfo")
+  tick=await asyncio.to_thread(http_json,"https://fapi.binance.com/fapi/v1/ticker/24hr")
+  qv={str(x.get("symbol","")).upper():float(x.get("quoteVolume") or 0) for x in tick}
+  dyn=[x["symbol"].upper() for x in info.get("symbols",[]) if is_crypto_perp(x) and qv.get(x["symbol"].upper(),0)>=PREMOVE_MIN_24H_QUOTE]
+  for x in ("BTCUSDT","ETHUSDT"):
+   if x not in dyn:dyn.append(x)
+  SYMBOLS=sorted(set(dyn),key=lambda x:(x not in ("BTCUSDT","ETHUSDT"),-qv.get(x,0)))
+ except Exception as e: print("PREMOVE UNIVERSE ERROR",repr(e))
+ ALT_CORE=[x for x in SYMBOLS if x not in ("BTCUSDT","ETHUSDT")]
+ print(f"PREMOVE UNIVERSE | total={len(SYMBOLS)} altCandidates={len(ALT_CORE)}")
+
+def futures_json(path):return http_json("https://fapi.binance.com"+path)
+
+def premove_rest_sync(sym):
+ out={"k":{},"oi":None,"funding":None,"ts":time.time()}
+ try:
+  a=futures_json("/fapi/v1/klines?symbol="+urllib.parse.quote(sym)+"&interval=1m&limit=61")
+  c=[float(x[4]) for x in a]; last=c[-1]
+  ret=lambda n:(last/c[-1-n]-1)*100
+  out["k"]={"r5":ret(5),"r15":ret(15),"r60":ret(60)}
+ except Exception:pass
+ try:
+  a=futures_json("/futures/data/openInterestHist?symbol="+urllib.parse.quote(sym)+"&period=5m&limit=4")
+  v=[float(x.get("sumOpenInterestValue") or 0) for x in a]
+  if len(v)>1 and v[0]>0:out["oi"]=(v[-1]/v[0]-1)*100
+ except Exception:pass
+ try:
+  out["funding"]=float(futures_json("/fapi/v1/premiumIndex?symbol="+urllib.parse.quote(sym)).get("lastFundingRate") or 0)*100
+ except Exception:pass
+ return out
+
+async def refresh_premove_market():
+ sem=asyncio.Semaphore(10)
+ async def one(x):
+  async with sem:return x,await asyncio.to_thread(premove_rest_sync,x)
+ while 1:
+  try:PREMOVE_MARKET.update(dict(await asyncio.gather(*(one(x) for x in ALT_CORE))));print("PREMOVE REST REFRESH",len(PREMOVE_MARKET))
+  except Exception as e:print("PREMOVE REST ERROR",repr(e))
+  await asyncio.sleep(max(60,int(os.getenv("PREMOVE_REST_SECONDS","300"))))
+
+def premove_candidate(sym):
+ if sym in ("BTCUSDT","ETHUSDT"):return None
+ a,b=window_metrics(sym,30),window_metrics(sym,60); btc=window_metrics("BTCUSDT",60); md=PREMOVE_MARKET.get(sym,{})
+ k=md.get("k") or {}
+ if not a or not b or not k:return None
+ side=1 if a["wimb"]+b["wimb"]>=0 else -1; word="LONG" if side>0 else "SHORT"
+ pumped=abs(k["r5"])>PREMOVE_QUIET_5M or abs(k["r15"])>PREMOVE_MAX_15M or abs(k["r60"])>PREMOVE_MAX_1H
+ w30=side*a["wimb"]; w60=side*b["wimb"]
+ flow=max(0,min(1,(.55*w30+.45*w60)/55)); improve=max(0,min(1,(w30-w60+20)/40))
+ persist=max(0,min(1,(a["persist"]+b["persist"])/1.44)); agree=max(0,min(1,(a["agreement"]+b["agreement"])/1.5))
+ align=1 if a["aligned"] and b["aligned"] else .35 if a["aligned"] or b["aligned"] else 0
+ early=max(0,min(1,(side*(.6*a["move"]+.4*b["move"])+.03)/.25))
+ quiet=max(0,1-min(1,abs(k["r5"])/max(.01,PREMOVE_QUIET_5M)))
+ rs60=side*(b["move"]-(btc["move"] if btc else 0)); rs=max(0,min(1,(rs60+.05)/.35))
+ oi=md.get("oi"); fr=md.get("funding"); ois=.5 if oi is None else max(0,min(1,(side*oi+.15)))
+ fs=.5 if fr is None else (1 if side*fr<=.01 else max(0,1-(side*fr-.01)/.08))
+ score=100*(.23*flow+.10*improve+.14*persist+.12*agree+.10*align+.08*early+.08*quiet+.07*rs+.05*ois+.03*fs)
+ h=PREMOVE_STATE[sym];h.append((side,score)); same=sum(1 for d,q in h if d==side and q>=PREMOVE_MIN_SCORE)
+ status="REJECT" if pumped else ("EARLY_"+word+"_WATCH" if same>=PREMOVE_MIN_PERSIST and score>=PREMOVE_STRONG_SCORE else "NOT_CONFIRMED" if score>=PREMOVE_MIN_SCORE else "REJECT")
+ reasons=[]
+ if pumped:reasons.append("recent-expansion")
+ if quiet>=.65:reasons.append("quiet")
+ if improve>=.6:reasons.append("flow-improving")
+ if align==1:reasons.append("spot+futures")
+ if rs>=.6:reasons.append("RS-vs-BTC")
+ if oi is not None and side*oi>0:reasons.append("OI-confirm")
+ if fr is not None and fs>=.7:reasons.append("funding-ok")
+ return dict(symbol=sym,side=word,status=status,score=score,same=same,w30=a["wimb"],w60=b["wimb"],m30=a["move"],m60=b["move"],rs=rs60,oi=oi,fr=fr,k=k,reasons=",".join(reasons) or "weak-evidence")
+
+def print_premove_top():
+ global PREMOVE_LAST_PRINT
+ if not PREMOVE_ENABLED or time.time()-PREMOVE_LAST_PRINT<PREMOVE_SCAN_SECONDS:return
+ PREMOVE_LAST_PRINT=time.time(); rows=[q for x in ALT_CORE if (q:=premove_candidate(x))]
+ rows.sort(key=lambda q:(q["status"].startswith("EARLY_"),q["score"]),reverse=True)
+ print(f"\n=== PREMOVE TOP {PREMOVE_TOP_N} | SCANNER-ONLY | NO ORDER ROUTING ===")
+ for i,q in enumerate(rows[:PREMOVE_TOP_N],1):
+  oi="N/A" if q["oi"] is None else f"{q['oi']:+.2f}%"; fr="N/A" if q["fr"] is None else f"{q['fr']:+.4f}%"
+  print(f" PREMOVE #{i:02d} {q['symbol']} {q['status']} {q['side']} score={q['score']:.1f} persistCycles={q['same']}/{PREMOVE_MIN_PERSIST} | wIMB30={q['w30']:+.1f}% wIMB60={q['w60']:+.1f}% | px30={q['m30']:+.3f}% px60={q['m60']:+.3f}% | 5m={q['k']['r5']:+.3f}% 15m={q['k']['r15']:+.3f}% 1h={q['k']['r60']:+.3f}% | RS60={q['rs']:+.3f}% OI={oi} funding={fr} | {q['reasons']}")
 
 async def load_meta():
  # V3.9: OKX REST may return HTTP 403 from cloud IPs. Try REST first, then the public
@@ -526,7 +622,7 @@ async def telegram_reporter_tick():
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
-  await asyncio.sleep(5);print(f"\n=== FLOW RADAR V4.1 | 4 EXCHANGES | SPOT + FUTURES | {W}s | FLOW CONFIRM ===")
+  await asyncio.sleep(5);print(f"\n=== MOMENTUM | FLOW RADAR V5.0 | {W}s | FLOW CONFIRM ===")
   for s in SYMBOLS:
    print(f"\n{s} price={price(s)}")
    votes=[]
@@ -551,18 +647,24 @@ async def report():
    detect(s)
   print("\n "+alt_breadth(30))
   print(" "+alt_breadth(60))
+  print_premove_top()
   await telegram_reporter_tick()
   outcomes(); score_outcomes()
 async def main():
- print("FLOW RADAR V4.1 STARTED | REGIME + BASELINE + MFE/MAE CALIBRATION | FLOW SCORE UNCHANGED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
+ print("FLOW RADAR V5.0 STARTED | MOMENTUM + PREMOVE | DYNAMIC BINANCE USD-M CRYPTO PERPS | READ-ONLY | PREMOVE NO ORDER ROUTING")
+ await load_binance_universe()
  await load_meta()
  if TG_TOKEN and TG_CHAT_ID:
   ok=await telegram_send("FLOW RADAR TELEGRAM REPORTER ONLINE - waiting for 30s/60s warm-up.")
   print("TELEGRAM STARTUP TEST OK" if ok else "TELEGRAM STARTUP TEST FAILED")
  else:
   print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
- tasks=[report()]
+ tasks=[report(),refresh_premove_market()]
+ venue_mode=os.getenv("PREMOVE_VENUES","BINANCE").upper()
  for s in SYMBOLS:
-  tasks += [binance(s,1),binance(s,0),bybit(s,1),bybit(s,0),okx(s,1),okx(s,0),gate(s,1),gate(s,0)]
+  tasks += [binance(s,1),binance(s,0)]
+  if "BYBIT" in venue_mode:tasks += [bybit(s,1),bybit(s,0)]
+  if "OKX" in venue_mode:tasks += [okx(s,1),okx(s,0)]
+  if "GATE" in venue_mode:tasks += [gate(s,1),gate(s,0)]
  await asyncio.gather(*tasks)
 asyncio.run(main())
