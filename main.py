@@ -2,6 +2,7 @@ import asyncio,json,os,time,csv,urllib.request
 from collections import defaultdict,deque
 from pathlib import Path
 import websockets
+import aiohttp
 
 SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",")]
 ALT_CORE=[x.strip().upper() for x in os.getenv("ALT_CORE","APTUSDT,ATOMUSDT,ARBUSDT,ALGOUSDT,OPUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,STXUSDT,TIAUSDT").split(",") if x.strip()]
@@ -13,6 +14,18 @@ buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={
 flow_history=defaultdict(lambda:deque(maxlen=120))
 setup_last={}
 score_pending=[]; score_last={}
+
+# Telegram sending: non-blocking, error-safe, timeout-protected
+telegram_lock = asyncio.Lock()
+telegram_last_regime = None  # Track regime state for change detection
+telegram_last_send = 0       # Cooldown: prevent spam
+telegram_regime_cooldown = 60  # Minimum seconds between regime sends (unless material change)
+telegram_material_threshold = 0.15  # Material change = 15% relative change in breadth/RS
+telegram_market_cache = {"ts": 0, "data": None}  # Cache public market context (CoinGecko)
+telegram_market_cache_ttl = 60  # Refresh market data only once per 60s
+
+def get_env_bool(key, default="true"):
+    return os.getenv(key, default).lower() in ("true", "1", "yes")
 
 def add(ex,s,p,base_qty,side,ts):
  usd=p*base_qty
@@ -443,6 +456,189 @@ def fast_setup(s):
          f"| weightedIMB={wimb:+.1f}% | agreement={agreement*100:.0f}% "
          f"| spotFut=YES | REPORT-ONLY")
 
+async def telegram_send(text):
+    """
+    Safe async POST to Telegram Bot API. Errors do NOT crash the radar.
+    - Timeout protection: 8 seconds max
+    - JSON error handling
+    - Logs failures to stdout for diagnostics only
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return  # Silently skip if env vars missing
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    data = await resp.text()
+                    print(f"[TELEGRAM] HTTP {resp.status}: {data[:200]}")
+    except asyncio.TimeoutError:
+        print("[TELEGRAM] Send timeout (8s)")
+    except aiohttp.ClientError as e:
+        print(f"[TELEGRAM] Client error: {repr(e)[:100]}")
+    except Exception as e:
+        print(f"[TELEGRAM] Unexpected error: {repr(e)[:100]}")
+
+async def fetch_market_context():
+    """
+    Fetch BTC price + market dominance from CoinGecko (free, no auth).
+    Non-blocking, cached for 60s, graceful fallback on failure.
+    Returns dict {btc_price, btc_change_24h, dominance} or fallback dict.
+    """
+    now = time.time()
+    if telegram_market_cache["ts"] > 0 and now - telegram_market_cache["ts"] < telegram_market_cache_ttl:
+        return telegram_market_cache["data"]
+    
+    fallback = {"btc_price": None, "btc_change_24h": None, "dominance": None}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.coingecko.com/api/v3/global",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    btc_dom = data.get("data", {}).get("btc_dominance", None)
+                    btc_change = data.get("data", {}).get("market_cap_change_percentage_24h_usd", None)
+                    result = {
+                        "btc_price": price("BTCUSDT"),
+                        "btc_change_24h": btc_change,
+                        "dominance": btc_dom
+                    }
+                    telegram_market_cache["ts"] = now
+                    telegram_market_cache["data"] = result
+                    return result
+    except Exception as e:
+        print(f"[TELEGRAM] Market context fetch failed: {repr(e)[:80]}")
+    
+    telegram_market_cache["ts"] = now
+    telegram_market_cache["data"] = fallback
+    return fallback
+
+async def telegram_regime_reporter():
+    """
+    Async task: sends regime change notifications to Telegram.
+    - Consumes market_regime(), breadth_metrics(60), window_metrics(BTCUSDT)
+    - Maps regime → color emoji + confidence thresholds
+    - De-duplicates on regime name + material metric changes
+    - Hourly summary if enabled
+    - Non-blocking: errors do NOT affect radar execution
+    """
+    global telegram_last_regime, telegram_last_send
+    
+    if not get_env_bool("TELEGRAM_REGIME_ENABLED", "true"):
+        return
+    
+    while True:
+        try:
+            await asyncio.sleep(60)  # Check every 60 seconds
+            
+            mr = market_regime()
+            btc_30 = window_metrics("BTCUSDT", 30)
+            btc_60 = window_metrics("BTCUSDT", 60)
+            bm = breadth_metrics(60)
+            
+            if not (mr and btc_30 and btc_60):
+                continue  # Still warming up, skip
+            
+            # Determine regime color: conservative thresholds account for low valid samples
+            regime_name = mr["name"]
+            btc_move_30 = btc_30["move"]
+            btc_move_60 = btc_60["move"]
+            breadth_net = bm["net"]
+            rs_60 = bm["rs"]
+            valid_alts = bm["valid"]
+            
+            # Confidence penalty for low valid sample count
+            confidence_factor = min(1.0, valid_alts / 8.0) if valid_alts > 0 else 0
+            
+            # Regime classification (GREEN/YELLOW/ORANGE/RED)
+            if (regime_name == "BULL" and 
+                btc_move_30 > 0 and btc_move_60 > 0 and 
+                breadth_net >= 0.3 and rs_60 >= 0.010 and
+                valid_alts >= 6):
+                regime_color = "🟢"
+                regime_label = "GREEN"
+            elif (regime_name == "SIDEWAYS" and 
+                  breadth_net > -0.2 and rs_60 > -0.005 and
+                  valid_alts >= 4):
+                regime_color = "🟡"
+                regime_label = "YELLOW"
+            elif (regime_name == "SIDEWAYS" or regime_name == "BULL"):
+                regime_color = "🟠"
+                regime_label = "ORANGE"
+            elif (regime_name == "BEAR" and 
+                  btc_move_30 < 0 and btc_move_60 < 0 and 
+                  breadth_net <= -0.3 and rs_60 <= -0.010 and
+                  valid_alts >= 6):
+                regime_color = "🔴"
+                regime_label = "RED"
+            else:
+                regime_color = "⚪"
+                regime_label = "UNKNOWN"
+            
+            # Detect regime change or material metric shift
+            now = time.time()
+            regime_changed = (telegram_last_regime is None or 
+                             telegram_last_regime["name"] != regime_name)
+            
+            material_change = False
+            if telegram_last_regime:
+                old_net = telegram_last_regime.get("net", 0)
+                old_rs = telegram_last_regime.get("rs", 0)
+                
+                # Material change: >15% relative shift in breadth/RS
+                if old_net != 0:
+                    net_change_rel = abs((breadth_net - old_net) / old_net)
+                    if net_change_rel > telegram_material_threshold:
+                        material_change = True
+                if old_rs != 0:
+                    rs_change_rel = abs((rs_60 - old_rs) / old_rs)
+                    if rs_change_rel > telegram_material_threshold:
+                        material_change = True
+            
+            send_now = (regime_changed or material_change) and (now - telegram_last_send >= telegram_regime_cooldown)
+            
+            # Optional: hourly summary regardless of change
+            if get_env_bool("TELEGRAM_HOURLY_SUMMARY", "false") and (now - telegram_last_send >= 3600):
+                send_now = True
+            
+            if send_now:
+                # Fetch market context (cached, non-blocking)
+                mkt = await fetch_market_context()
+                btc_price = mkt.get("btc_price")
+                btc_change_24h = mkt.get("btc_change_24h")
+                dominance = mkt.get("dominance")
+                
+                # Build message
+                msg = f"{regime_color} <b>REGIME: {regime_label}</b> [{regime_name}]\n"
+                msg += f"📊 BTC: ${btc_price:.0f}" if btc_price else "📊 BTC: $—"
+                if btc_change_24h is not None:
+                    msg += f" | 24h: {btc_change_24h:+.1f}%"
+                msg += "\n"
+                
+                msg += f"📈 Breadth ({valid_alts}/{len(ALT_CORE)}): {breadth_net:+.2f} | "
+                msg += f"RS60: {rs_60:+.3f}%\n"
+                msg += f"🔹 BTC 30s: {btc_move_30:+.3f}% | 60s: {btc_move_60:+.3f}%"
+                if dominance is not None:
+                    msg += f"\n🌐 Dominance: {dominance:.1f}%"
+                
+                if valid_alts < 6:
+                    msg += f"\n⚠️ <i>Low sample ({valid_alts}/{len(ALT_CORE)}): lower confidence</i>"
+                
+                await telegram_send(msg)
+                telegram_last_regime = {"name": regime_name, "net": breadth_net, "rs": rs_60}
+                telegram_last_send = now
+        
+        except Exception as e:
+            print(f"[TELEGRAM REPORTER] Error: {repr(e)[:100]}")
+            await asyncio.sleep(5)
+
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
@@ -474,9 +670,11 @@ async def report():
   outcomes(); score_outcomes()
 
 async def main():
- print("FLOW RADAR V4.1 STARTED | REGIME + BASELINE + MFE/MAE CALIBRATION | FLOW SCORE UNCHANGED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
+ print("FLOW RADAR V4.1 STARTED | REGIME + BASELINE + MFE/MAE CALIBRATION | FLOW SCORE UNCHANGED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s | TELEGRAM REPORTER")
  await load_meta()
- tasks=[report()]
+ # Send startup message
+ await telegram_send("✅ <b>FLOW RADAR TELEGRAM REPORTER ONLINE</b>\nMonitoring market regime changes...")
+ tasks=[report(), telegram_regime_reporter()]
  for s in SYMBOLS:
   tasks += [binance(s,1),binance(s,0),bybit(s,1),bybit(s,0),okx(s,1),okx(s,0),gate(s,1),gate(s,0)]
  await asyncio.gather(*tasks)
