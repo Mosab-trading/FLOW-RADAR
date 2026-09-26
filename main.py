@@ -551,11 +551,16 @@ async def report():
    detect(s)
   print("\n "+alt_breadth(30))
   print(" "+alt_breadth(60))
+  await telegram_reporter_tick()
   outcomes(); score_outcomes()
-
 async def main():
  print("FLOW RADAR V4.1 STARTED | REGIME + BASELINE + MFE/MAE CALIBRATION | FLOW SCORE UNCHANGED | 15 SYMBOLS | ALT BREADTH | BINANCE + BYBIT + OKX + GATE | SPOT + FUTURES | READ-ONLY | FAST SETUP 15s + FLOW CONFIRM 15s/30s/60s")
  await load_meta()
+ if TG_TOKEN and TG_CHAT_ID:
+  ok=await telegram_send("FLOW RADAR TELEGRAM REPORTER ONLINE - waiting for 30s/60s warm-up.")
+  print("TELEGRAM STARTUP TEST OK" if ok else "TELEGRAM STARTUP TEST FAILED")
+ else:
+  print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
  tasks=[report()]
  for s in SYMBOLS:
   tasks += [binance(s,1),binance(s,0),bybit(s,1),bybit(s,0),okx(s,1),okx(s,0),gate(s,1),gate(s,0)]
