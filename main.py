@@ -1,5 +1,5 @@
 import asyncio,json,os,time,csv,urllib.request,urllib.parse,math,threading
-from http.server import BaseHTTPRequestHandler,HTTPServer
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from collections import defaultdict,deque
 from pathlib import Path
 import websockets
@@ -625,14 +625,15 @@ class _RedStateHandler(BaseHTTPRequestHandler):
  def do_GET(self):
   if self.path not in ("/","/state"):
    self.send_response(404); self.end_headers(); return
-  RED_STATE["heartbeat_ts"]=time.time()\n  body=json.dumps(RED_STATE,separators=(",",":")).encode()
+  RED_STATE["heartbeat_ts"]=time.time()
+  body=json.dumps(dict(RED_STATE),separators=(",",":")).encode()
   self.send_response(200); self.send_header("Content-Type","application/json")
   self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
  def log_message(self,format,*args): return
 
 def start_red_state_server():
  port=int(os.getenv("PORT","8080"))
- HTTPServer(("0.0.0.0",port),_RedStateHandler).serve_forever()
+ ThreadingHTTPServer(("0.0.0.0",port),_RedStateHandler).serve_forever(poll_interval=0.2)
 
 
 def telegram_send_sync(text):
