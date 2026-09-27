@@ -122,14 +122,28 @@ def print_premove_top():
  global PREMOVE_LAST_PRINT
  if not PREMOVE_ENABLED or time.time()-PREMOVE_LAST_PRINT<PREMOVE_SCAN_SECONDS:return
  PREMOVE_LAST_PRINT=time.time(); rows=[q for x in ALT_CORE if (q:=premove_candidate(x))]
- rows.sort(key=lambda q:(q["status"].startswith("EARLY_"),q["score"]),reverse=True)
- top=rows[:PREMOVE_TOP_N]
+ confirmed=[q for q in rows if q["status"].startswith("EARLY_")]
+ longs=sorted([q for q in confirmed if q["side"]=="LONG"],key=lambda q:q["score"],reverse=True)[:PREMOVE_TOP_N]
+ shorts=sorted([q for q in confirmed if q["side"]=="SHORT"],key=lambda q:q["score"],reverse=True)[:PREMOVE_TOP_N]
+ # Keep top10 backward-compatible, but balance both directions so SHORT signals cannot be crowded out by LONGs.
+ half=max(1,PREMOVE_TOP_N//2)
+ top=(longs[:half]+shorts[:half])
+ if len(top)<PREMOVE_TOP_N:
+  used={q["symbol"] for q in top}
+  rest=sorted([q for q in confirmed if q["symbol"] not in used],key=lambda q:q["score"],reverse=True)
+  top += rest[:PREMOVE_TOP_N-len(top)]
+ def pub(q):
+  return {"symbol":q["symbol"],"side":q["side"],"status":q["status"],"score":round(q["score"],2),"persist":q["same"],"venues":q["venues"],"w30":round(q["w30"],3),"w60":round(q["w60"],3),"oi":q["oi"],"funding":q["fr"]}
  RED_STATE["premove_ts"]=PREMOVE_LAST_PRINT
- RED_STATE["top10"]=[{"symbol":q["symbol"],"side":q["side"],"status":q["status"],"score":round(q["score"],2),"persist":q["same"],"venues":q["venues"],"w30":round(q["w30"],3),"w60":round(q["w60"],3),"oi":q["oi"],"funding":q["fr"]} for q in top]
- print(f"\n=== PREMOVE TOP {PREMOVE_TOP_N} | SCANNER-ONLY | NO ORDER ROUTING ===")
- for i,q in enumerate(top,1):
-  oi="N/A" if q["oi"] is None else f"{q['oi']:+.2f}%"; fr="N/A" if q["fr"] is None else f"{q['fr']:+.4f}%"
-  print(f" PREMOVE #{i:02d} {q['symbol']} {q['status']} {q['side']} score={q['score']:.1f} VENUES={q['venues']}/4[{q['venue_names']}] persistCycles={q['same']}/{PREMOVE_MIN_PERSIST} | wIMB30={q['w30']:+.1f}% wIMB60={q['w60']:+.1f}% | px30={q['m30']:+.3f}% px60={q['m60']:+.3f}% | 5m={q['k']['r5']:+.3f}% 15m={q['k']['r15']:+.3f}% 1h={q['k']['r60']:+.3f}% | RS60={q['rs']:+.3f}% OI={oi} funding={fr} | {q['reasons']}")
+ RED_STATE["top10"]=[pub(q) for q in top]
+ RED_STATE["longs"]=[pub(q) for q in longs]
+ RED_STATE["shorts"]=[pub(q) for q in shorts]
+ print(f"\n=== PREMOVE LONG + SHORT | SCANNER-ONLY | NO ORDER ROUTING ===")
+ for label,group in (("LONG",longs),("SHORT",shorts)):
+  print(f" --- {label} ---")
+  for i,q in enumerate(group,1):
+   oi="N/A" if q["oi"] is None else f"{q['oi']:+.2f}%"; fr="N/A" if q["fr"] is None else f"{q['fr']:+.4f}%"
+   print(f" {label} #{i:02d} {q['symbol']} {q['status']} score={q['score']:.1f} VENUES={q['venues']}/4[{q['venue_names']}] persistCycles={q['same']}/{PREMOVE_MIN_PERSIST} | wIMB30={q['w30']:+.1f}% wIMB60={q['w60']:+.1f}% | px30={q['m30']:+.3f}% px60={q['m60']:+.3f}% | OI={oi} funding={fr} | {q['reasons']}")
 
 
 async def premove_publisher_loop():
