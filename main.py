@@ -738,6 +738,29 @@ async def red_state_reporter_loop():
   await asyncio.sleep(5)
 
 
+async def flow_history_loop():
+ # Keep 30s/60s PREMOVE + RED history fresh independently of the heavy report pass.
+ spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]
+ fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
+ while 1:
+  started=time.time()
+  for sym in SYMBOLS:
+   try:
+    sb,ss,sd,si,sc=group(sym,spot)
+    fb,ffs,fd,fi,fc=group(sym,fut)
+    ab,ase,ad,ai,ac=flow(sym)
+    votes=[]
+    for ex in spot+fut:
+     b,se,d,im,n=flow(sym,W,ex)
+     if b+se>=1000:votes.append("BUY" if d>0 else "SELL")
+    remember_confirm(sym,price(sym),sd,fd,ad,ai,ab,ase,votes.count("BUY"),votes.count("SELL"))
+   except Exception as e:
+    print("FLOW HISTORY UPDATE ERROR",sym,repr(e))
+   await asyncio.sleep(0)
+  elapsed=time.time()-started
+  print(f"FLOW HISTORY REFRESH | symbols={len(SYMBOLS)} elapsed={elapsed:.2f}s")
+  await asyncio.sleep(max(0.5,5.0-elapsed))
+
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
@@ -754,7 +777,7 @@ async def report():
    sb,ss,sd,si,sc=group(sym,spot)
    fb,ffs,fd,fi,fc=group(sym,fut)
    ab,ase,ad,ai,ac=flow(sym)
-   remember_confirm(sym,price(sym),sd,fd,ad,ai,ab,ase,votes.count("BUY"),votes.count("SELL"))
+   # flow_history is refreshed independently by flow_history_loop().
    fs=flow_score(sym)
    if fs:
     if MOMENTUM_VERBOSE:
@@ -770,7 +793,7 @@ async def report():
   outcomes()
   score_outcomes()
 async def main():
- print("FLOW RADAR V5.3 STARTED | PREMOVE TOP-10 QUIET LOG | OKX SUPPORTED-MARKETS ONLY | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
+ print("FLOW RADAR V5.4 STARTED | PREMOVE TOP-10 QUIET LOG | OKX SUPPORTED-MARKETS ONLY | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
  threading.Thread(target=start_red_state_server,daemon=True).start()
  await load_binance_universe()
  # Optional exchange metadata runs in background so PREMOVE starts immediately.
@@ -779,7 +802,7 @@ async def main():
   print("TELEGRAM STARTUP TEST OK" if ok else "TELEGRAM STARTUP TEST FAILED")
  else:
   print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
- tasks=[report(),premove_publisher_loop(),red_state_reporter_loop(),refresh_premove_market(),venue_metadata_background()]
+ tasks=[report(),flow_history_loop(),premove_publisher_loop(),red_state_reporter_loop(),refresh_premove_market(),venue_metadata_background()]
  # Keep all four venue families. Unsupported contracts reconnect harmlessly; discovered
  # metadata/actual trades are reflected in VENUES x/4 instead of blocking the scanner.
  for s in SYMBOLS:
