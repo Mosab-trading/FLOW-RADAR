@@ -696,10 +696,13 @@ def regime_message(snap,pub,reason):
          f"REPORT-ONLY. Short-term flow can reverse; this is not a certain directional outcome.")
 
 async def telegram_reporter_tick():
- snap=reporter_snapshot()
- if not snap:return
  n=time.time()
- RED_STATE["regime"]=snap["regime"]; RED_STATE["ts"]=n
+ RED_STATE["heartbeat_ts"]=n
+ snap=reporter_snapshot()
+ if not snap:
+  RED_STATE["valid"]=False
+  return
+ RED_STATE["regime"]=snap["regime"]; RED_STATE["ts"]=n; RED_STATE["valid"]=True
  old=reporter_state["regime"]; changed=old is not None and snap["regime"]!=old
  first=old is None; hourly=n-reporter_state["last_hourly"]>=TG_HOURLY
  if first or (changed and n-reporter_state["last_change"]>=TG_CHANGE_COOLDOWN) or hourly:
