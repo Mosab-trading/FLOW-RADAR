@@ -132,6 +132,17 @@ def print_premove_top():
   print(f" PREMOVE #{i:02d} {q['symbol']} {q['status']} {q['side']} score={q['score']:.1f} VENUES={q['venues']}/4[{q['venue_names']}] persistCycles={q['same']}/{PREMOVE_MIN_PERSIST} | wIMB30={q['w30']:+.1f}% wIMB60={q['w60']:+.1f}% | px30={q['m30']:+.3f}% px60={q['m60']:+.3f}% | 5m={q['k']['r5']:+.3f}% 15m={q['k']['r15']:+.3f}% 1h={q['k']['r60']:+.3f}% | RS60={q['rs']:+.3f}% OI={oi} funding={fr} | {q['reasons']}")
 
 
+async def premove_publisher_loop():
+ # Publish PREMOVE independently from the expensive full-universe report cycle.
+ # This prevents 30s/60s signal windows expiring when the report pass gets slow.
+ while 1:
+  try:
+   print_premove_top()
+  except Exception as e:
+   print("PREMOVE PUBLISH ERROR",repr(e))
+  await asyncio.sleep(2)
+
+
 async def discover_bybit():
  """Discover Bybit linear USDT symbols without blocking PREMOVE startup."""
  try:
@@ -756,11 +767,10 @@ async def report():
   if MOMENTUM_VERBOSE:
    print("\n "+alt_breadth(30))
    print(" "+alt_breadth(60))
-  print_premove_top()
   outcomes()
   score_outcomes()
 async def main():
- print("FLOW RADAR V5.2 STARTED | PREMOVE TOP-10 QUIET LOG | OKX SUPPORTED-MARKETS ONLY | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
+ print("FLOW RADAR V5.3 STARTED | PREMOVE TOP-10 QUIET LOG | OKX SUPPORTED-MARKETS ONLY | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
  threading.Thread(target=start_red_state_server,daemon=True).start()
  await load_binance_universe()
  # Optional exchange metadata runs in background so PREMOVE starts immediately.
@@ -769,7 +779,7 @@ async def main():
   print("TELEGRAM STARTUP TEST OK" if ok else "TELEGRAM STARTUP TEST FAILED")
  else:
   print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
- tasks=[report(),red_state_reporter_loop(),refresh_premove_market(),venue_metadata_background()]
+ tasks=[report(),premove_publisher_loop(),red_state_reporter_loop(),refresh_premove_market(),venue_metadata_background()]
  # Keep all four venue families. Unsupported contracts reconnect harmlessly; discovered
  # metadata/actual trades are reflected in VENUES x/4 instead of blocking the scanner.
  for s in SYMBOLS:
