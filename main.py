@@ -620,12 +620,12 @@ TG_MIN_VALID=int(os.getenv("TELEGRAM_MIN_VALID","5"))
 reporter_state={"regime":None,"last_change":0.0,"last_hourly":0.0,"public":{},"public_ts":0.0}
 
 # --- RED STATE OUTPUT FOR LIVE BOT (does not alter indicator calculation) ---
-RED_STATE={"regime":"WARMING","ts":0.0}
+RED_STATE={"regime":"WARMING","ts":0.0,"heartbeat_ts":time.time(),"valid":False}
 class _RedStateHandler(BaseHTTPRequestHandler):
  def do_GET(self):
   if self.path not in ("/","/state"):
    self.send_response(404); self.end_headers(); return
-  body=json.dumps(RED_STATE,separators=(",",":")).encode()
+  RED_STATE["heartbeat_ts"]=time.time()\n  body=json.dumps(RED_STATE,separators=(",",":")).encode()
   self.send_response(200); self.send_header("Content-Type","application/json")
   self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
  def log_message(self,format,*args): return
