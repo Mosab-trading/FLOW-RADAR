@@ -123,8 +123,11 @@ def print_premove_top():
  if not PREMOVE_ENABLED or time.time()-PREMOVE_LAST_PRINT<PREMOVE_SCAN_SECONDS:return
  PREMOVE_LAST_PRINT=time.time(); rows=[q for x in ALT_CORE if (q:=premove_candidate(x))]
  rows.sort(key=lambda q:(q["status"].startswith("EARLY_"),q["score"]),reverse=True)
+ top=rows[:PREMOVE_TOP_N]
+ RED_STATE["premove_ts"]=PREMOVE_LAST_PRINT
+ RED_STATE["top10"]=[{"symbol":q["symbol"],"side":q["side"],"status":q["status"],"score":round(q["score"],2),"persist":q["same"],"venues":q["venues"],"w30":round(q["w30"],3),"w60":round(q["w60"],3),"oi":q["oi"],"funding":q["fr"]} for q in top]
  print(f"\n=== PREMOVE TOP {PREMOVE_TOP_N} | SCANNER-ONLY | NO ORDER ROUTING ===")
- for i,q in enumerate(rows[:PREMOVE_TOP_N],1):
+ for i,q in enumerate(top,1):
   oi="N/A" if q["oi"] is None else f"{q['oi']:+.2f}%"; fr="N/A" if q["fr"] is None else f"{q['fr']:+.4f}%"
   print(f" PREMOVE #{i:02d} {q['symbol']} {q['status']} {q['side']} score={q['score']:.1f} VENUES={q['venues']}/4[{q['venue_names']}] persistCycles={q['same']}/{PREMOVE_MIN_PERSIST} | wIMB30={q['w30']:+.1f}% wIMB60={q['w60']:+.1f}% | px30={q['m30']:+.3f}% px60={q['m60']:+.3f}% | 5m={q['k']['r5']:+.3f}% 15m={q['k']['r15']:+.3f}% 1h={q['k']['r60']:+.3f}% | RS60={q['rs']:+.3f}% OI={oi} funding={fr} | {q['reasons']}")
 
@@ -620,7 +623,7 @@ TG_MIN_VALID=int(os.getenv("TELEGRAM_MIN_VALID","5"))
 reporter_state={"regime":None,"last_change":0.0,"last_hourly":0.0,"public":{},"public_ts":0.0}
 
 # --- RED STATE OUTPUT FOR LIVE BOT (does not alter indicator calculation) ---
-RED_STATE={"regime":"WARMING","ts":0.0,"heartbeat_ts":time.time(),"valid":False}
+RED_STATE={"regime":"WARMING","ts":0.0,"heartbeat_ts":time.time(),"valid":False,"premove_ts":0.0,"top10":[]}
 class _RedStateHandler(BaseHTTPRequestHandler):
  def do_GET(self):
   if self.path not in ("/","/state"):
@@ -705,7 +708,8 @@ async def telegram_reporter_tick():
  RED_STATE["regime"]=snap["regime"]; RED_STATE["ts"]=n; RED_STATE["valid"]=True
  old=reporter_state["regime"]; changed=old is not None and snap["regime"]!=old
  first=old is None; hourly=n-reporter_state["last_hourly"]>=TG_HOURLY
- if first or (changed and n-reporter_state["last_change"]>=TG_CHANGE_COOLDOWN) or hourly:
+ critical_red=changed and snap["regime"]=="RED"
+ if first or critical_red or (changed and n-reporter_state["last_change"]>=TG_CHANGE_COOLDOWN) or hourly:
   pub=await public_market()
   reason="STARTUP" if first else (f"REGIME CHANGE {old} -> {snap['regime']}" if changed else "HOURLY SUMMARY")
   if await telegram_send(regime_message(snap,pub,reason)):
