@@ -708,6 +708,16 @@ async def telegram_reporter_tick():
    if first or changed: reporter_state["regime"]=snap["regime"]; reporter_state["last_change"]=n
    reporter_state["last_hourly"]=n
 
+async def red_state_reporter_loop():
+ # Keep /state fresh independently from the long full-universe scan.
+ # The existing RED/ORANGE/GREEN calculation is unchanged.
+ while 1:
+  try:
+   await telegram_reporter_tick()
+  except Exception as e:
+   print("RED STATE REPORTER ERROR",repr(e))
+  await asyncio.sleep(5)
+
 
 async def report():
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]; fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
@@ -715,6 +725,7 @@ async def report():
   await asyncio.sleep(5)
   if MOMENTUM_VERBOSE: print(f"\n=== MOMENTUM | FLOW RADAR V5.1 | {W}s | FLOW CONFIRM ===")
   for sym in SYMBOLS:
+   await asyncio.sleep(0)
    votes=[]
    if MOMENTUM_VERBOSE: print(f"\n{sym} price={price(sym)}")
    for ex in spot+fut:
@@ -738,7 +749,6 @@ async def report():
    print("\n "+alt_breadth(30))
    print(" "+alt_breadth(60))
   print_premove_top()
-  await telegram_reporter_tick()
   outcomes()
   score_outcomes()
 async def main():
@@ -751,7 +761,7 @@ async def main():
   print("TELEGRAM STARTUP TEST OK" if ok else "TELEGRAM STARTUP TEST FAILED")
  else:
   print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
- tasks=[report(),refresh_premove_market(),venue_metadata_background()]
+ tasks=[report(),red_state_reporter_loop(),refresh_premove_market(),venue_metadata_background()]
  # Keep all four venue families. Unsupported contracts reconnect harmlessly; discovered
  # metadata/actual trades are reflected in VENUES x/4 instead of blocking the scanner.
  for s in SYMBOLS:
