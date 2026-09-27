@@ -134,10 +134,14 @@ def print_premove_top():
   top += rest[:PREMOVE_TOP_N-len(top)]
  def pub(q):
   return {"symbol":q["symbol"],"side":q["side"],"status":q["status"],"score":round(q["score"],2),"persist":q["same"],"venues":q["venues"],"w30":round(q["w30"],3),"w60":round(q["w60"],3),"oi":q["oi"],"funding":q["fr"]}
- RED_STATE["premove_ts"]=PREMOVE_LAST_PRINT
- RED_STATE["top10"]=[pub(q) for q in top]
- RED_STATE["longs"]=[pub(q) for q in longs]
- RED_STATE["shorts"]=[pub(q) for q in shorts]
+ # Do not erase a fresh confirmed signal just because one 15s scan is empty.
+ # Publish/refresh only directions that actually have confirmed candidates.
+ # AMD already enforces PREMOVE_MAX_AGE from premove_ts, so stale signals expire safely.
+ if confirmed:
+  RED_STATE["premove_ts"]=PREMOVE_LAST_PRINT
+  RED_STATE["top10"]=[pub(q) for q in top]
+  if longs: RED_STATE["longs"]=[pub(q) for q in longs]
+  if shorts: RED_STATE["shorts"]=[pub(q) for q in shorts]
  print(f"\n=== PREMOVE LONG + SHORT | SCANNER-ONLY | NO ORDER ROUTING ===")
  for label,group in (("LONG",longs),("SHORT",shorts)):
   print(f" --- {label} ---")
