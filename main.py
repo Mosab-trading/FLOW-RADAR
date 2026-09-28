@@ -25,7 +25,7 @@ D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.cs
 buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
 # Raw trade persistence must never block the WebSocket/event loop.
 # Strategy calculations continue to use the in-memory buf exactly as before.
-RAW_WRITE_ENABLED=os.getenv("RAW_WRITE_ENABLED","1").lower() not in ("0","false","no")
+RAW_WRITE_ENABLED=os.getenv("RAW_WRITE_ENABLED","0").lower() not in ("0","false","no")
 RAW_QUEUE=queue.Queue(maxsize=int(os.getenv("RAW_QUEUE_MAX","200000")))
 RAW_DROPPED=0
 
@@ -204,7 +204,7 @@ async def feed_health_watchdog():
    total=max(1,len(ALT_CORE))
    cov30=active30/total; cov60=active60/total
    print(f"FEED HEALTH | newest_age={age:.1f}s active30={active30}/{total} active60={active60}/{total}")
-   broken=age>60 or cov60<0.35
+   broken=age>60 or cov60<0.70
    if broken:
     if not bad_since: bad_since=now
     if now-bad_since>=30:
