@@ -150,6 +150,22 @@ def print_premove_top():
    print(f" {label} #{i:02d} {q['symbol']} {q['status']} score={q['score']:.1f} VENUES={q['venues']}/4[{q['venue_names']}] persistCycles={q['same']}/{PREMOVE_MIN_PERSIST} | wIMB30={q['w30']:+.1f}% wIMB60={q['w60']:+.1f}% | px30={q['m30']:+.3f}% px60={q['m60']:+.3f}% | OI={oi} funding={fr} | {q['reasons']}")
 
 
+async def feed_health_watchdog():
+ # If every trade feed goes stale, the process can look alive while PREMOVE has no 30/60s data.
+ # Exit with failure so Railway restarts all WebSocket sessions cleanly.
+ await asyncio.sleep(90)
+ while 1:
+  try:
+   newest=max((q[-1]["ts"] for q in buf.values() if q),default=0)
+   age=time.time()-newest if newest else 999999
+   if age>60:
+    print(f"FEED WATCHDOG STALE | newest_trade_age={age:.1f}s -> forcing clean restart")
+    os._exit(1)
+  except Exception as e:
+   print("FEED WATCHDOG ERROR",repr(e))
+  await asyncio.sleep(15)
+
+
 async def premove_publisher_loop():
  # Publish PREMOVE independently from the expensive full-universe report cycle.
  # This prevents 30s/60s signal windows expiring when the report pass gets slow.
@@ -278,7 +294,7 @@ async def load_meta():
 
 async def binance(s,spot):
  ex="BINANCE_SPOT" if spot else "BINANCE_FUTURES"
- u=(f"wss://stream.binance.com:9443/ws/{s.lower()}@aggTrade" if spot else f"wss://fstream.binance.com/market/ws/{s.lower()}@aggTrade")
+ u=(f"wss://stream.binance.com:9443/ws/{s.lower()}@aggTrade" if spot else f"wss://fstream.binance.com/ws/{s.lower()}@aggTrade")
  while 1:
   try:
    async with websockets.connect(u,ping_interval=20,ping_timeout=20,max_queue=30000) as w:
@@ -820,7 +836,7 @@ async def main():
   print("TELEGRAM STARTUP TEST OK" if ok else "TELEGRAM STARTUP TEST FAILED")
  else:
   print("TELEGRAM REPORTER DISABLED | missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
- tasks=[report(),flow_history_loop(),premove_publisher_loop(),red_state_reporter_loop(),refresh_premove_market(),venue_metadata_background()]
+ tasks=[report(),flow_history_loop(),premove_publisher_loop(),feed_health_watchdog(),red_state_reporter_loop(),refresh_premove_market(),venue_metadata_background()]
  # Keep all four venue families. Unsupported contracts reconnect harmlessly; discovered
  # metadata/actual trades are reflected in VENUES x/4 instead of blocking the scanner.
  for s in SYMBOLS:
