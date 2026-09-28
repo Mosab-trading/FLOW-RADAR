@@ -1,4 +1,4 @@
-import asyncio,json,os,time,csv,urllib.request,urllib.parse,math,threading,queue
+import asyncio,json,os,time,csv,urllib.request,urllib.parse,math,threading,queue,itertools
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from collections import defaultdict,deque
 from pathlib import Path
@@ -253,14 +253,16 @@ async def venue_metadata_background():
  print("VENUE DISCOVERY READY | coverage known for",len(VENUE_AVAILABLE),"symbols")
 
 def venue_coverage(sym):
- # Count venue families with either discovered metadata or recent actual trade data.
+ # Inspect only the newest records directly from the deque.
+ # Never materialize the full (up to 500k) trade buffer on every PREMOVE scan.
  fam=set(VENUE_AVAILABLE.get(sym,set()))
- for t in list(buf[sym])[-5000:]:
+ for t in itertools.islice(reversed(buf[sym]),5000):
   ex=str(t.get("ex",""))
   if ex.startswith("BINANCE"):fam.add("BINANCE")
   elif ex.startswith("BYBIT"):fam.add("BYBIT")
   elif ex.startswith("OKX"):fam.add("OKX")
   elif ex.startswith("GATE"):fam.add("GATE")
+  if len(fam)>=4: break
  return len(fam),fam
 
 async def load_meta():
