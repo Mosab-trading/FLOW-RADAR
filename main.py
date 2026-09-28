@@ -665,7 +665,7 @@ TG_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID","").strip()
 TG_HOURLY=int(os.getenv("TELEGRAM_HOURLY_SECONDS","3600"))
 TG_CHANGE_COOLDOWN=int(os.getenv("TELEGRAM_CHANGE_COOLDOWN","180"))
 TG_MIN_VALID=int(os.getenv("TELEGRAM_MIN_VALID","5"))
-reporter_state={"regime":None,"last_change":0.0,"last_hourly":0.0,"public":{},"public_ts":0.0}
+reporter_state={"regime":None,"last_change":0.0,"last_hourly":0.0,"public":{},"public_ts":0.0,"raw_regime":None,"raw_since":0.0,"raw_60_logged":False}
 
 # --- RED STATE OUTPUT FOR LIVE BOT (does not alter indicator calculation) ---
 RED_STATE={"regime":"WARMING","ts":0.0,"heartbeat_ts":time.time(),"valid":False,"premove_ts":0.0,"top10":[]}
@@ -752,6 +752,19 @@ async def telegram_reporter_tick():
   return
  RED_STATE["regime"]=snap["regime"]; RED_STATE["ts"]=n; RED_STATE["valid"]=True
  RED_STATE["b30"]=snap["b30"]; RED_STATE["b60"]=snap["b60"]
+ raw=snap["regime"]
+ prev_raw=reporter_state["raw_regime"]
+ if prev_raw is None:
+  reporter_state["raw_regime"]=raw; reporter_state["raw_since"]=n; reporter_state["raw_60_logged"]=False
+  if raw in ("RED","GREEN"): print(f"REGIME TIMER START | {raw} | ts={n:.3f}")
+ elif raw!=prev_raw:
+  dur=max(0.0,n-reporter_state["raw_since"])
+  if prev_raw in ("RED","GREEN"): print(f"REGIME TIMER END | {prev_raw} | duration={dur:.1f}s | next={raw}")
+  reporter_state["raw_regime"]=raw; reporter_state["raw_since"]=n; reporter_state["raw_60_logged"]=False
+  if raw in ("RED","GREEN"): print(f"REGIME TIMER START | {raw} | ts={n:.3f}")
+ elif raw in ("RED","GREEN") and not reporter_state["raw_60_logged"] and n-reporter_state["raw_since"]>=60:
+  reporter_state["raw_60_logged"]=True
+  print(f"REGIME TIMER 60S | {raw} | duration={n-reporter_state['raw_since']:.1f}s")
  old=reporter_state["regime"]; changed=old is not None and snap["regime"]!=old
  first=old is None; hourly=n-reporter_state["last_hourly"]>=TG_HOURLY
  critical_red=changed and snap["regime"]=="RED"
