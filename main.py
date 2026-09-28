@@ -121,8 +121,20 @@ def premove_candidate(sym):
 def print_premove_top():
  global PREMOVE_LAST_PRINT
  if not PREMOVE_ENABLED or time.time()-PREMOVE_LAST_PRINT<PREMOVE_SCAN_SECONDS:return
- PREMOVE_LAST_PRINT=time.time(); rows=[q for x in ALT_CORE if (q:=premove_candidate(x))]
+ PREMOVE_LAST_PRINT=time.time()
+ # Diagnostic counts make an all-empty scan actionable instead of ambiguous.
+ diag={"total":len(ALT_CORE),"no30":0,"no60":0,"norest":0,"scored":0}
+ rows=[]
+ for x in ALT_CORE:
+  a=window_metrics(x,30); b=window_metrics(x,60); md=PREMOVE_MARKET.get(x,{})
+  if not a: diag["no30"]+=1
+  if not b: diag["no60"]+=1
+  if not (md.get("k") or {}): diag["norest"]+=1
+  q=premove_candidate(x)
+  if q: rows.append(q); diag["scored"]+=1
  confirmed=[q for q in rows if q["status"].startswith("EARLY_")]
+ if not confirmed:
+  print(f"PREMOVE EMPTY DIAG | total={diag['total']} scored={diag['scored']} no30={diag['no30']} no60={diag['no60']} noREST={diag['norest']} marketCache={len(PREMOVE_MARKET)}")
  longs=sorted([q for q in confirmed if q["side"]=="LONG"],key=lambda q:q["score"],reverse=True)[:PREMOVE_TOP_N]
  shorts=sorted([q for q in confirmed if q["side"]=="SHORT"],key=lambda q:q["score"],reverse=True)[:PREMOVE_TOP_N]
  # Keep top10 backward-compatible, but balance both directions so SHORT signals cannot be crowded out by LONGs.
