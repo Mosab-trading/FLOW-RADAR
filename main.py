@@ -1,4 +1,4 @@
-import asyncio,json,os,time,csv,urllib.request,urllib.parse,math,threading
+import asyncio,json,os,time,csv,urllib.request,urllib.parse,math,threading,queue
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from collections import defaultdict,deque
 from pathlib import Path
@@ -23,15 +23,42 @@ TRADFI_BASES={x.strip().upper() for x in os.getenv("PREMOVE_TRADFI_BASES","AAPL,
 W=int(os.getenv("FLOW_WINDOW","5")); MIN=float(os.getenv("EVENT_MIN_USD","50000")); IMB=float(os.getenv("EVENT_IMBALANCE","70")); COOL=int(os.getenv("EVENT_COOLDOWN","10"))
 D=Path("data");D.mkdir(exist_ok=True); RAW=D/"trades.jsonl"; EVENTS=D/"events.csv"; SCORES=D/"flow_scores.csv"; CALIB=D/"flow_score_regime_calibration.csv"
 buf=defaultdict(lambda:deque(maxlen=500000)); pending=[]; last={}; multipliers={}
+# Raw trade persistence must never block the WebSocket/event loop.
+# Strategy calculations continue to use the in-memory buf exactly as before.
+RAW_WRITE_ENABLED=os.getenv("RAW_WRITE_ENABLED","1").lower() not in ("0","false","no")
+RAW_QUEUE=queue.Queue(maxsize=int(os.getenv("RAW_QUEUE_MAX","200000")))
+RAW_DROPPED=0
+
+def raw_writer():
+ global RAW_DROPPED
+ batch=[]; last_flush=time.time()
+ while 1:
+  try:
+   line=RAW_QUEUE.get(timeout=0.5); batch.append(line)
+  except queue.Empty:
+   pass
+  now=time.time()
+  if batch and (len(batch)>=1000 or now-last_flush>=0.5):
+   try:
+    with RAW.open("a") as f:f.writelines(batch)
+   except Exception as e:
+    print("RAW WRITER ERROR",repr(e))
+   batch.clear(); last_flush=now
+  if RAW_DROPPED:
+   print("RAW QUEUE DROPPED",RAW_DROPPED,"records; live flow unaffected")
+   RAW_DROPPED=0
 # V3.5 diagnostic confirmation layer; original EVENT/RESULT logic remains unchanged.
 flow_history=defaultdict(lambda:deque(maxlen=120))
 setup_last={}
 score_pending=[]; score_last={}
 
 def add(ex,s,p,base_qty,side,ts):
+ global RAW_DROPPED
  usd=p*base_qty
  t={"ts":ts,"ex":ex,"s":s,"p":p,"qty":base_qty,"usd":usd,"side":side};buf[s].append(t)
- with RAW.open("a") as f:f.write(json.dumps(t,separators=(",",":"))+"\n")
+ if RAW_WRITE_ENABLED:
+  try: RAW_QUEUE.put_nowait(json.dumps(t,separators=(",",":"))+"\n")
+  except queue.Full: RAW_DROPPED+=1
 
 def http_json(url):
  req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 FlowRadar/3.9","Accept":"application/json"})
@@ -163,16 +190,28 @@ def print_premove_top():
 
 
 async def feed_health_watchdog():
- # If every trade feed goes stale, the process can look alive while PREMOVE has no 30/60s data.
- # Exit with failure so Railway restarts all WebSocket sessions cleanly.
- await asyncio.sleep(90)
+ # Detect partial/global feed collapse by coverage, not merely one surviving recent trade.
+ # No strategy thresholds are changed; this only restarts a broken data plane.
+ await asyncio.sleep(120)
+ bad_since=0.0
  while 1:
   try:
+   now=time.time()
    newest=max((q[-1]["ts"] for q in buf.values() if q),default=0)
-   age=time.time()-newest if newest else 999999
-   if age>60:
-    print(f"FEED WATCHDOG STALE | newest_trade_age={age:.1f}s -> forcing clean restart")
-    os._exit(1)
+   age=now-newest if newest else 999999
+   active30=sum(1 for s in ALT_CORE if buf[s] and now-buf[s][-1]["ts"]<=30)
+   active60=sum(1 for s in ALT_CORE if buf[s] and now-buf[s][-1]["ts"]<=60)
+   total=max(1,len(ALT_CORE))
+   cov30=active30/total; cov60=active60/total
+   print(f"FEED HEALTH | newest_age={age:.1f}s active30={active30}/{total} active60={active60}/{total}")
+   broken=age>60 or cov60<0.35
+   if broken:
+    if not bad_since: bad_since=now
+    if now-bad_since>=30:
+     print(f"FEED WATCHDOG COLLAPSE | age={age:.1f}s cov30={cov30:.1%} cov60={cov60:.1%} -> forcing clean restart")
+     os._exit(1)
+   else:
+    bad_since=0.0
   except Exception as e:
    print("FEED WATCHDOG ERROR",repr(e))
   await asyncio.sleep(15)
@@ -861,6 +900,7 @@ async def report():
 async def main():
  print("FLOW RADAR V5.4 STARTED | PREMOVE TOP-10 QUIET LOG | OKX SUPPORTED-MARKETS ONLY | 4-VENUE FLOW | MOMENTUM CALCS ACTIVE | READ-ONLY | NO ORDER ROUTING")
  threading.Thread(target=start_red_state_server,daemon=True).start()
+ if RAW_WRITE_ENABLED: threading.Thread(target=raw_writer,daemon=True).start()
  await load_binance_universe()
  # Optional exchange metadata runs in background so PREMOVE starts immediately.
  if TG_TOKEN and TG_CHAT_ID:
