@@ -788,11 +788,13 @@ async def red_state_reporter_loop():
 
 async def flow_history_loop():
  # Keep 30s/60s PREMOVE + RED history fresh independently of the heavy report pass.
+ # Snapshot one timestamp per pass and yield in small batches so hundreds of websocket
+ # readers cannot starve this loop long enough for the 30s/60s confirmation windows to expire.
  spot=["BINANCE_SPOT","BYBIT_SPOT","OKX_SPOT","GATE_SPOT"]
  fut=["BINANCE_FUTURES","BYBIT_FUTURES","OKX_FUTURES","GATE_FUTURES"]
  while 1:
   started=time.time()
-  for sym in SYMBOLS:
+  for idx,sym in enumerate(SYMBOLS):
    try:
     sb,ss,sd,si,sc=group(sym,spot)
     fb,ffs,fd,fi,fc=group(sym,fut)
@@ -804,9 +806,13 @@ async def flow_history_loop():
     remember_confirm(sym,price(sym),sd,fd,ad,ai,ab,ase,votes.count("BUY"),votes.count("SELL"))
    except Exception as e:
     print("FLOW HISTORY UPDATE ERROR",sym,repr(e))
-   await asyncio.sleep(0)
+   if idx%16==15:
+    await asyncio.sleep(0)
   elapsed=time.time()-started
-  print(f"FLOW HISTORY REFRESH | symbols={len(SYMBOLS)} elapsed={elapsed:.2f}s")
+  if elapsed>2.0:
+   print(f"FLOW HISTORY SLOW | symbols={len(SYMBOLS)} elapsed={elapsed:.2f}s")
+  else:
+   print(f"FLOW HISTORY REFRESH | symbols={len(SYMBOLS)} elapsed={elapsed:.2f}s")
   await asyncio.sleep(max(0.5,5.0-elapsed))
 
 async def report():
