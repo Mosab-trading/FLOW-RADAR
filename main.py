@@ -750,7 +750,8 @@ async def telegram_reporter_tick():
  if not snap:
   RED_STATE["valid"]=False
   return
- RED_STATE["regime"]=snap["regime"]; RED_STATE["ts"]=n; RED_STATE["valid"]=True\n RED_STATE["b30"]=snap["b30"]; RED_STATE["b60"]=snap["b60"]
+ RED_STATE["regime"]=snap["regime"]; RED_STATE["ts"]=n; RED_STATE["valid"]=True
+ RED_STATE["b30"]=snap["b30"]; RED_STATE["b60"]=snap["b60"]
  old=reporter_state["regime"]; changed=old is not None and snap["regime"]!=old
  first=old is None; hourly=n-reporter_state["last_hourly"]>=TG_HOURLY
  critical_red=changed and snap["regime"]=="RED"
